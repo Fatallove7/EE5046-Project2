@@ -1,0 +1,19 @@
+# 排除 Python 缓存
+__pycache__/
+*.pyc
+
+# 排除 IDE 配置
+.idea/
+
+# 排除数据集 (数据集通常很大，不建议存入 Git，建议手动备份)
+Dataset/
+
+# 排除训练模型和日志 (文件通常很大)
+Model_File/
+Trained_Multimodal_Models/
+Logs/
+Evaluation_Results/
+LLM_Models/
+
+# 排除大图
+Figures/
