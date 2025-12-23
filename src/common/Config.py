@@ -29,7 +29,7 @@ JSON_PATH = "/home/xusi/EE5046_Projects/Dataset/MMID/multimodal_instruction_data
 
 
 # ==================== 对比实验配置 ====================
-COMPARISON_EXPERIMENT = True  # 是否进行对比实验
+COMPARISON_EXPERIMENT = False  # 是否进行对比实验
 COMPARISON_MODE = 'augment'    # 'stream'对比stream配置, 'augment'对比数据增强
 
 # Stream对比配置

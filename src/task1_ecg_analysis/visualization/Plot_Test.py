@@ -1,6 +1,6 @@
 import json
-from ECGAnalyzer import ECGAnalyzer
-from Config import DATASET_PATH
+from src.task1_ecg_analysis.models.ECGAnalyzer import ECGAnalyzer
+from src.common.Config import DATASET_PATH
 
 analyzer = ECGAnalyzer(DATASET_PATH)
 

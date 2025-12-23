@@ -5,50 +5,58 @@ import pandas as pd
 from torch.utils.data import Dataset
 import scipy.io as io
 import torch
-from Config import FIXED_LENGTH, DOWNSAMPLE_RATE, AUGMENT_SETTING
+from src.common.Config import FIXED_LENGTH, DOWNSAMPLE_RATE, AUGMENT_SETTING
 from scipy.interpolate import interp1d
 
 
 class ECG_dataset(Dataset):
 
-    def __init__(self, base_file=None, cv=0, is_train=True, augment=AUGMENT_SETTING):
+    def __init__(self, base_file=None, cv=0, is_train=True, augment=AUGMENT_SETTING,data_list=None):
         # specify annotation file for dataset
         self.is_train = is_train
         # 是否启用数据增强
         self.augment = augment
         self.base_file = base_file
-
-        if isinstance(cv, int):
-            cv_indices = [cv]
-        elif isinstance(cv, list):
-            cv_indices = cv
+        if data_list is not None:
+            # 将data_list转换为与原有格式一致
+            formatted_data = []
+            for item in data_list:
+                # item应该是(filename, label)
+                formatted_data.append([0, item[0], item[1]])
+            self.file = np.array(formatted_data)
+            print(f"ECG_dataset Loaded: {len(self.file)} samples from provided data_list")
         else:
-            raise ValueError("CV parameter must be an integer (for test fold) or a list of integers (for train folds).")
-
-        # ------------------------------------------------------------------
-        # 替换原有的加载/拼接逻辑，直接加载指定的 CSV 文件
-        # ------------------------------------------------------------------
-        all_records = []
-        cv_path = os.path.join(base_file, 'cv')
-        loaded_cvs = []
-
-        for i in cv_indices:
-            csv_file = os.path.join(cv_path, f'cv{i}.csv')
-
-            if os.path.exists(csv_file):
-                data = pd.read_csv(csv_file)
-                # 将数据帧的值（记录）添加到 all_records 中
-                all_records.extend(data.values)
-                loaded_cvs.append(str(i))
+            if isinstance(cv, int):
+                cv_indices = [cv]
+            elif isinstance(cv, list):
+                cv_indices = cv
             else:
-                # 警告：文件未找到
-                print(f"Warning: {csv_file} not found for K-Fold loading.")
+                raise ValueError("CV parameter must be an integer (for test fold) or a list of integers (for train folds).")
 
-            # 将所有的记录合并为最终的 file 数组
-        self.file = np.array(all_records)
+            # ------------------------------------------------------------------
+            # 替换原有的加载/拼接逻辑，直接加载指定的 CSV 文件
+            # ------------------------------------------------------------------
+            all_records = []
+            cv_path = os.path.join(base_file, 'cv')
+            loaded_cvs = []
 
-        # 打印加载摘要，方便调试
-        print(f"ECG_dataset Loaded: {len(self.file)} samples from CV folds: [{', '.join(loaded_cvs)}]")
+            for i in cv_indices:
+                csv_file = os.path.join(cv_path, f'cv{i}.csv')
+
+                if os.path.exists(csv_file):
+                    data = pd.read_csv(csv_file)
+                    # 将数据帧的值（记录）添加到 all_records 中
+                    all_records.extend(data.values)
+                    loaded_cvs.append(str(i))
+                else:
+                    # 警告：文件未找到
+                    print(f"Warning: {csv_file} not found for K-Fold loading.")
+
+                # 将所有的记录合并为最终的 file 数组
+            self.file = np.array(all_records)
+
+            # 打印加载摘要，方便调试
+            print(f"ECG_dataset Loaded: {len(self.file)} samples from CV folds: [{', '.join(loaded_cvs)}]")
 
     def __len__(self):
         return self.file.shape[0]

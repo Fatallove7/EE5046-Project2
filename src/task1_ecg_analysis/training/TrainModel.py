@@ -1,7 +1,7 @@
 # %%
 import torch
 import torch.nn as nn
-from Config import FIXED_LENGTH, INPUT_CHANNELS, OUTPUT_CLASSES
+from src.common.Config import FIXED_LENGTH, INPUT_CHANNELS, OUTPUT_CLASSES
 
 # %%
 # In this section, we will apply an CNN to extract features and implement a classification task.
@@ -187,7 +187,6 @@ class Mscnn(nn.Module):
         # ==================== 自动计算 MLP 输入维度 ====================
         # 1. 创建一个假的输入数据，形状为 [1, 1, 3000]
         # 注意：这里的 3000 必须和你 dataset 中 crop_padding 的长度一致！
-        FIXED_LENGTH = 3000
         dummy_input = torch.zeros(1, ch_in, FIXED_LENGTH)
 
         # 2. 计算 Stream 1 的输出大小

@@ -12,8 +12,8 @@ import numpy as np
 
 # 导入您自定义的模块
 # 请确保以下导入路径对于您运行的脚本是正确的
-from ECGDataset import ECG_dataset
-from Config import FIXED_LENGTH, DOWNSAMPLE_RATE
+from src.task1_ecg_analysis.data.ECGDataset import ECG_dataset
+from src.common.Config import FIXED_LENGTH, DOWNSAMPLE_RATE
 
 
 # 注意：为了让 ECGAnalyzer 独立工作，ECG_dataset 的依赖（如 time_scaling, add_noise）
