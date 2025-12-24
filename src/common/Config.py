@@ -19,7 +19,7 @@ EARLY_STOP_PATIENCE = 15
 MIN_DELTA = 1e-4
 
 # 实验模式
-EXPERIMENT_MODE = "search"  # search/train/full/compare
+EXPERIMENT_MODE = "full"  # search/train/full/compare
 
 # 最佳模型文件位置
 CNN_WEIGHTS_PATH = "/home/xusi/Logs/FinalTraining/Results_20251212_112634/Best_Models/Mscnn_K37_S2_E39_Aug_LR0p001_BS32_Best_F3.pth"
