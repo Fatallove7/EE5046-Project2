@@ -34,21 +34,24 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import pandas as pd
 import torch
-from sklearn.metrics import (accuracy_score, roc_auc_score, roc_curve, 
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.metrics import (accuracy_score, balanced_accuracy_score, roc_auc_score, roc_curve, 
                            precision_score, recall_score, f1_score)
 from torch.utils.data import DataLoader,random_split
 from tqdm import tqdm
 
 # 自定义模块
 from src.common.Config import (AUGMENT_SETTING, BATCH_SIZE, EARLY_STOP_PATIENCE,
-                    EXPERIMENT_MODE, FIXED_LENGTH, INPUT_CHANNELS,
-                    LEARNING_RATE, MIN_DELTA, NUM_EPOCHS, OUTPUT_CLASSES,
+                    EXPERIMENT_MODE, FIXED_LENGTH, FOCAL_PRESET_CONFIGS, INPUT_CHANNELS,
+                    LEARNING_RATE, LOSS_FUNCTION_CONFIG, MIN_DELTA, NUM_EPOCHS, OUTPUT_CLASSES, USE_FOCAL_LOSS,
                     USE_STREAM2_SETTING, COMPARISON_MODE,
                     STREAM_COMPARISON_CONFIGS, AUGMENTATION_COMPARISON_CONFIGS,
-                    DEFAULT_KERNEL_CONFIG)
+                    DEFAULT_KERNEL_CONFIG,LR_SCHEDULER_CONFIG, get_loss_config)
 from src.task1_ecg_analysis.data.DataManager import DataManager
 from src.task1_ecg_analysis.data.FoldDataset import FoldDataset
 from src.task1_ecg_analysis.visualization.TrainingVisualizer import TrainingVisualizer
+from src.task1_ecg_analysis.data.BalancedFoldDataset import BalancedFoldDataset
 from TrainModel import Mscnn
 
 
@@ -142,8 +145,122 @@ class CompositeScoreCalculator:
         
         return normalized
 
+# ==================== FocalLoss类 ====================
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for dense object detection.
+    Paper: Focal Loss for Dense Object Detection
+    https://arxiv.org/abs/1708.02002
+    
+    Args:
+        alpha (float, optional): Weighting factor for the rare class (0 < alpha < 1).
+        gamma (float, optional): Focusing parameter (gamma >= 0). Higher gamma reduces 
+                                the loss contribution from easy examples.
+        reduction (str, optional): Specifies the reduction to apply to the output:
+                                   'none' | 'mean' | 'sum'
+        logits (bool, optional): If True, expects raw logits as input,
+                                 otherwise expects probabilities (0-1).
+    """
+    
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean', logits=True):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.logits = logits
+        
+    def forward(self, inputs, targets):
+        if self.logits:
+            # If using logits, apply sigmoid first
+            BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        else:
+            # If using probabilities, use regular BCE
+            BCE_loss = F.binary_cross_entropy(inputs, targets, reduction='none')
+        
+        # Get probabilities from logits if needed
+        if self.logits:
+            pt = torch.sigmoid(inputs)
+        else:
+            pt = inputs
+        
+        # Ensure pt is within [0, 1]
+        pt = torch.clamp(pt, 1e-8, 1 - 1e-8)
+        
+        # Calculate p_t
+        p_t = pt * targets + (1 - pt) * (1 - targets)
+        
+        # Calculate alpha_t
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        
+        # Calculate modulating factor
+        modulating_factor = (1 - p_t) ** self.gamma
+        
+        # Focal loss
+        focal_loss = alpha_t * modulating_factor * BCE_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
 
-# ==================== 模型文件管理器（保持不变） ====================
+
+class WeightedFocalLoss(nn.Module):
+    """
+    Weighted Focal Loss with dynamic alpha calculation based on class distribution.
+    """
+    
+    def __init__(self, pos_weight=None, gamma=2.0, reduction='mean', logits=True):
+        super(WeightedFocalLoss, self).__init__()
+        self.pos_weight = pos_weight
+        self.gamma = gamma
+        self.reduction = reduction
+        self.logits = logits
+        
+    def forward(self, inputs, targets):
+        if self.logits:
+            BCE_loss = F.binary_cross_entropy_with_logits(
+                inputs, targets, reduction='none'
+            )
+        else:
+            BCE_loss = F.binary_cross_entropy(inputs, targets, reduction='none')
+        
+        # Get probabilities from logits if needed
+        if self.logits:
+            pt = torch.sigmoid(inputs)
+        else:
+            pt = inputs
+        
+        # Ensure pt is within [0, 1]
+        pt = torch.clamp(pt, 1e-8, 1 - 1e-8)
+        
+        # Calculate p_t
+        p_t = pt * targets + (1 - pt) * (1 - targets)
+        
+        # Calculate alpha_t based on class distribution
+        if self.pos_weight is not None:
+            # Use provided pos_weight to calculate alpha
+            alpha_t = self.pos_weight * targets + (1 - targets)
+            # Normalize so that alpha_t sums to 2 (like in original focal loss)
+            alpha_t = alpha_t / (alpha_t.mean() + 1e-8) * 1.0
+        else:
+            # Default: equal weighting
+            alpha_t = torch.ones_like(targets)
+        
+        # Calculate modulating factor
+        modulating_factor = (1 - p_t) ** self.gamma
+        
+        # Focal loss
+        focal_loss = alpha_t * modulating_factor * BCE_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+# ==================== 模型文件管理器 ====================
 class ModelFileManager:
     """管理模型文件的保存和加载"""
     
@@ -241,7 +358,8 @@ class ModelTrainer:
     
     def __init__(self, base_path, kernel_config, batch_size, lr, 
                  use_stream2, augment, experiment_dir, config_name=None,
-                 composite_weights=None):
+                 composite_weights=None,lr_scheduler_config=None,
+                 use_focal_loss=USE_FOCAL_LOSS,focal_alpha=0.25,focal_gamma=2.0):
         self.base_path = base_path
         self.kernel_config = kernel_config
         self.batch_size = batch_size
@@ -252,11 +370,25 @@ class ModelTrainer:
         self.config_name = config_name
         self.file_manager = ModelFileManager()
         self.visualizer = TrainingVisualizer()
+
+        # Focal Loss相关参数
+        self.use_focal_loss = use_focal_loss
+        self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
+
+        # 打印配置信息
+        if self.use_focal_loss:
+            print(f"📈 使用Focal Loss: alpha={focal_alpha}, gamma={focal_gamma}")
+        else:
+            print(f"📈 使用BCEWithLogitsLoss")
         
         # 综合评分权重
         self.composite_weights = composite_weights or CompositeScoreCalculator.DEFAULT_WEIGHTS
-        
 
+        # 学习率调度器配置
+        self.lr_scheduler_config = lr_scheduler_config or LR_SCHEDULER_CONFIG  # 使用配置或默认配置
+        print(f"📈 学习率调度器配置: {self.lr_scheduler_config['scheduler_type']}")
+        
         print(f"初始化DataManager，数据集路径: {self.base_path}")
         if not os.path.exists(self.base_path):
             print(f"❌ 数据集路径不存在: {self.base_path}")
@@ -275,29 +407,186 @@ class ModelTrainer:
         self.best_epoch = 0
         self.early_stop_counter = 0
 
+    def _two_stage_evaluate(self, probs, labels, stage1_th=0.4, stage2_th=None):
+        """两阶段评估"""
+        if stage2_th is None:
+            # 如果没有指定第二阶段阈值，使用单阶段最优阈值
+            stage2_th, _, _, _ = self._find_optimal_threshold(labels, probs)
+        
+        print(f"两阶段阈值策略: 第一阶段={stage1_th:.2f}, 第二阶段={stage2_th:.2f}")
+        
+        # 第一阶段：低阈值获取高召回
+        stage1_preds = (probs >= stage1_th).astype(int)
+        stage1_recall = recall_score(labels, stage1_preds, zero_division=0)
+        print(f"第一阶段召回率: {stage1_recall:.4f}")
+        
+        # 第二阶段：只对第一阶段预测为正的样本使用高阈值
+        stage1_pos_indices = np.where(stage1_preds == 1)[0]
+        if len(stage1_pos_indices) == 0:
+            print("⚠️ 第一阶段没有预测为正的样本")
+            return stage1_preds
+        
+        stage1_pos_probs = probs[stage1_pos_indices]
+        
+        # 对这些样本使用第二阶段阈值
+        stage2_pos_preds = (stage1_pos_probs >= stage2_th).astype(int)
+        
+        # 合并结果
+        final_preds = stage1_preds.copy()
+        final_preds[stage1_pos_indices] = stage2_pos_preds
+        
+        # 计算指标
+        final_recall = recall_score(labels, final_preds, zero_division=0)
+        final_precision = precision_score(labels, final_preds, zero_division=0)
+        final_f1 = f1_score(labels, final_preds, zero_division=0)
+        final_acc = accuracy_score(labels, final_preds)
+        
+        print(f"第二阶段结果:")
+        print(f"  召回率: {final_recall:.4f} (相比第一阶段: {final_recall-stage1_recall:+.4f})")
+        print(f"  精确率: {final_precision:.4f}")
+        print(f"  F1分数: {final_f1:.4f}")
+        print(f"  准确率: {final_acc:.4f}")
+        
+        return {
+            'predictions': final_preds,
+            'acc': final_acc,
+            'recall': final_recall,
+            'precision': final_precision,
+            'f1': final_f1,
+            'stage1_threshold': stage1_th,
+            'stage2_threshold': stage2_th,
+            'stage1_recall': stage1_recall
+        }
+
+    def _create_criterion(self, pos_weight, device):
+        """创建损失函数（支持BCE和Focal Loss）"""
+        if self.use_focal_loss:
+            # 使用Focal Loss
+            if self.focal_alpha is not None:
+                # 使用固定的alpha
+                criterion = FocalLoss(
+                    alpha=self.focal_alpha,
+                    gamma=self.focal_gamma,
+                    reduction='mean',
+                    logits=True
+                ).to(device)
+            else:
+                # 使用加权Focal Loss
+                criterion = WeightedFocalLoss(
+                    pos_weight=pos_weight,
+                    gamma=self.focal_gamma,
+                    reduction='mean',
+                    logits=True
+                ).to(device)
+            print(f"✅ 创建Focal Loss: alpha={self.focal_alpha if self.focal_alpha else 'dynamic'}, "
+                f"gamma={self.focal_gamma}")
+        else:
+            # 使用BCEWithLogitsLoss
+            criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight).to(device)
+            print(f"✅ 创建BCEWithLogitsLoss: pos_weight={pos_weight.item():.2f}")
+        
+        return criterion
+
+    def _create_lr_scheduler(self, optimizer, num_epochs, train_loader=None):
+        """根据配置创建学习率调度器"""
+        if not self.lr_scheduler_config.get('use_scheduler', True):
+            print("⚠️ 未启用学习率调度器")
+            return None
+        
+        scheduler_type = self.lr_scheduler_config.get('scheduler_type', 'plateau')
+        
+        if scheduler_type == 'plateau':
+            config = self.lr_scheduler_config.get('plateau_config', {})
+            # 移除 verbose 参数
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode=config.get('mode', 'max'),
+                factor=config.get('factor', 0.5),
+                patience=config.get('patience', 5),
+                min_lr=config.get('min_lr', 1e-6),
+                # verbose=config.get('verbose', True)  # 注释掉或移除这行
+            )
+            print(f"✅ 创建 ReduceLROnPlateau 调度器，耐心值: {config.get('patience', 5)}")
+        
+        elif scheduler_type == 'cosine':
+            config = self.lr_scheduler_config.get('cosine_config', {})
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=config.get('T_max', num_epochs),
+                eta_min=config.get('eta_min', 1e-6)
+            )
+            print(f"✅ 创建 CosineAnnealingLR 调度器，T_max: {config.get('T_max', num_epochs)}")
+        
+        elif scheduler_type == 'onecycle':
+            config = self.lr_scheduler_config.get('onecycle_config', {})
+            if train_loader is None:
+                print("⚠️ OneCycleLR 需要 train_loader，使用默认调度器")
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
+            else:
+                scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                    optimizer,
+                    max_lr=config.get('max_lr', self.lr),
+                    steps_per_epoch=len(train_loader),
+                    epochs=num_epochs,
+                    pct_start=config.get('pct_start', 0.3),
+                    div_factor=config.get('div_factor', 25.0),
+                    final_div_factor=config.get('final_div_factor', 1e4)
+                )
+                print(f"✅ 创建 OneCycleLR 调度器，max_lr: {config.get('max_lr', self.lr)}")
+        
+        elif scheduler_type == 'step':
+            config = self.lr_scheduler_config.get('step_config', {})
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer,
+                step_size=config.get('step_size', 10),
+                gamma=config.get('gamma', 0.5)
+            )
+            print(f"✅ 创建 StepLR 调度器，step_size: {config.get('step_size', 10)}, gamma: {config.get('gamma', 0.5)}")
+        
+        else:
+            print(f"⚠️ 未知的学习率调度器类型: {scheduler_type}，使用默认 ReduceLROnPlateau")
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode='max',
+                factor=0.5,
+                patience=5,
+                min_lr=1e-6
+                # verbose=True  # 同样移除这里的 verbose
+            )
+        
+        return scheduler
+    
     def cross_validate_on_train_set(self, train_cv_indices, num_epochs, k_folds=5, save_models=True):
         """
-        在训练集上进行K折交叉验证
+        在训练集上进行K折交叉验证（简化输出版本）
         """
         print(f"\n{'='*60}")
-        print(f"在训练集上进行 {k_folds} 折交叉验证")
+        print(f"🎯 开始 {k_folds} 折交叉验证")
+        print(f"训练集: CV{', '.join(map(str, train_cv_indices))}")
+        print(f"模型配置: {self.kernel_config.get('name', 'Unknown')}")
+        print(f"批次大小: {self.batch_size}, 学习率: {self.lr}")
+        print(f"数据增强: {'是' if self.augment else '否'}")
         print(f"{'='*60}")
         
         # 创建K折划分
         kfold_splits = self.data_manager.create_kfold_splits(train_cv_indices, k_folds)
         if not kfold_splits:
-            print("错误: 无法创建K折划分")
+            print("❌ 错误: 无法创建K折划分")
             return {}, []
         
         fold_results = []
         fold_models = []
 
-        # 使用进度条显示折的训练进度
-        fold_pbar = self.visualizer.create_progress_bar(k_folds, "交叉验证进度")
+        # 创建简洁的进度条
+        fold_pbar = tqdm(
+            range(k_folds), 
+            desc="交叉验证进度",
+            bar_format='{desc}: {percentage:3.0f}%|{bar:20}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+        )
         
         # 训练每一折
         for fold_idx, (train_data, val_data) in enumerate(kfold_splits):
-            print(f"\n--- 第 {fold_idx + 1}/{k_folds} 折 ---")
+            fold_pbar.set_description(f"训练折 {fold_idx+1}/{k_folds}")
             
             # 训练当前折
             fold_result, fold_model = self._train_single_fold(
@@ -306,24 +595,19 @@ class ModelTrainer:
             
             fold_results.append(fold_result)
             fold_models.append(fold_model)
+            
+            # 更新进度条并显示当前折的结果
+            fold_pbar.set_postfix({
+                'acc': f"{fold_result['best_val_acc']:.3f}",
+                'f1': f"{fold_result['best_val_f1']:.3f}"
+            })
+            
+            # 显示当前折的简单结果
+            print(f"  ✅ 折 {fold_idx+1} 完成: 验证准确率={fold_result['best_val_acc']:.4f}, "
+                f"F1={fold_result['best_val_f1']:.4f} (最佳 epoch {fold_result['best_epoch']})")
 
-            # 更新进度条
             fold_pbar.update(1)
-            
-            # 使用综合评分进行评价
-            metrics = {
-                'accuracy': fold_result['best_val_acc'],
-                'auc': fold_result['best_val_auc'],
-                'f1': fold_result['best_val_f1']
-            }
-            composite_score, breakdown = CompositeScoreCalculator.calculate_composite_score(metrics)
-            
-            print(f"折 {fold_idx + 1} 结果:")
-            print(f"  验证准确率: {fold_result['best_val_acc']:.4f}")
-            print(f"  AUC: {fold_result['best_val_auc']:.4f}")
-            print(f"  F1分数: {fold_result['best_val_f1']:.4f}")
-            print(f"  综合评分: {composite_score:.4f}")
-
+        
         fold_pbar.close()
         
         # 计算平均指标
@@ -387,18 +671,40 @@ class ModelTrainer:
                     'val_auc': best_fold_result['best_val_auc'],
                     'val_f1': best_fold_result['best_val_f1'],
                     'composite_score': best_composite_score,
-                    'epoch': best_fold_result['best_epoch']
+                    'epoch': best_fold_result['best_epoch'],
+                    'early_stopped': best_fold_result.get('early_stopped', False)
                 }
                 self.file_manager.save_model(best_model, model_path, metadata)
+                
+                print(f"  💾 最佳模型已保存: {model_name}")
         
+        # 显示交叉验证结果总结
         print(f"\n{'='*60}")
-        print(f"{k_folds}折交叉验证结果汇总:")
+        print(f"📊 {k_folds}折交叉验证结果总结")
         print(f"{'='*60}")
-        print(f"平均验证准确率: {avg_metrics['avg_val_acc']:.4f} ± {avg_metrics['std_val_acc']:.4f}")
-        print(f"平均AUC: {avg_metrics['avg_val_auc']:.4f} ± {avg_metrics['std_val_auc']:.4f}")
-        print(f"平均F1分数: {avg_metrics['avg_val_f1']:.4f} ± {avg_metrics['std_val_f1']:.4f}")
-        print(f"平均综合评分: {avg_metrics['avg_composite_score']:.4f}")
-
+        
+        # 显示每折详细结果
+        print(f"{'折':<4} {'验证准确率':<12} {'AUC':<12} {'F1分数':<12} {'综合评分':<12} {'最佳epoch':<10}")
+        print(f"{'-'*70}")
+        
+        for i, result in enumerate(fold_results):
+            metrics = {
+                'accuracy': result['best_val_acc'],
+                'auc': result['best_val_auc'],
+                'f1': result['best_val_f1']
+            }
+            composite_score, _ = CompositeScoreCalculator.calculate_composite_score(metrics)
+            
+            print(f" {i+1:<3} {result['best_val_acc']:<12.4f} {result['best_val_auc']:<12.4f} "
+                f"{result['best_val_f1']:<12.4f} {composite_score:<12.4f} {result['best_epoch']:<10}")
+        
+        print(f"{'-'*70}")
+        print(f" 平均: {avg_metrics['avg_val_acc']:<12.4f} {avg_metrics['avg_val_auc']:<12.4f} "
+            f"{avg_metrics['avg_val_f1']:<12.4f} {avg_metrics['avg_composite_score']:<12.4f}")
+        print(f" 标准差: {avg_metrics['std_val_acc']:<12.4f} {avg_metrics['std_val_auc']:<12.4f} "
+            f"{avg_metrics['std_val_f1']:<12.4f}")
+        print(f"{'='*60}")
+        
         # 可视化交叉验证结果
         if self.experiment_dir:
             self._visualize_cv_results(fold_results, avg_metrics)
@@ -424,6 +730,21 @@ class ModelTrainer:
             print("错误: 训练集数据为空")
             return None, {}
         
+        # 新增：检查数据分布
+        print("\n=== 数据分布诊断 ===")
+        
+        # 检查整个训练集的类别分布
+        all_labels = []
+        for _, label in train_data:
+            all_labels.append(label)
+        
+        all_labels_np = np.array(all_labels)
+        print(f"整个训练集 (CV0~CV3) 统计:")
+        print(f"  总样本数: {len(all_labels_np)}")
+        print(f"  正样本数: {np.sum(all_labels_np)}")
+        print(f"  负样本数: {len(all_labels_np) - np.sum(all_labels_np)}")
+        print(f"  正样本比例: {np.mean(all_labels_np):.2%}")
+        
         # 划分训练集和验证集
         total_size = len(train_data)
         val_size = int(total_size * val_ratio)
@@ -432,15 +753,58 @@ class ModelTrainer:
         # 随机划分
         torch.manual_seed(42)  # 确保可重复性
         train_subset, val_subset = random_split(train_data, [train_size, val_size])
+
+        # 新增：检查划分后的分布
+        train_labels = []
+        for idx in train_subset.indices:
+            _, label = train_data[idx]
+            train_labels.append(label)
         
-        print(f"训练样本数: {train_size}, 验证样本数: {val_size}")
+        val_labels = []
+        for idx in val_subset.indices:
+            _, label = train_data[idx]
+            val_labels.append(label)
         
-        # 创建数据集
-        train_dataset = FoldDataset(
-            list(train_subset), self.base_path, is_train=True, augment=self.augment
+        print(f"\n划分后统计:")
+        print(f"  训练集大小: {train_size}, 验证集大小: {val_size}")
+        print(f"  训练集正样本比例: {np.mean(train_labels):.2%}")
+        print(f"  验证集正样本比例: {np.mean(val_labels):.2%}")
+        print(f"  训练集类别分布: 正={np.sum(train_labels)}, 负={len(train_labels)-np.sum(train_labels)}")
+        print(f"  验证集类别分布: 正={np.sum(val_labels)}, 负={len(val_labels)-np.sum(val_labels)}")
+            
+        # 创建平衡数据集
+        train_dataset = BalancedFoldDataset(
+            list(train_subset),
+            base_path=self.base_path,
+            is_train=True,
+            augment=True,
+            target_ratio=0.5,  # 1:3.3 的比例，比原始1:10更平衡
+            augmentation_config={
+                'positive_augment_factor': 15,  # 大幅增加正样本增强倍数（原来是3）
+                'noise_std': 0.02,              # 增加噪声强度
+                'scale_range': (0.8, 1.2),      # 扩大缩放范围
+                'shift_range': (-25, 25),       # 扩大平移范围
+                'use_mixup': True,
+                'mixup_alpha': 0.3,             # 增加mixup强度
+                'use_time_warp': True,          # 新增时间扭曲
+                'time_warp_factor': 0.4,
+                'use_random_cutout': True,      # 新增随机遮挡
+                'cutout_size': 60,
+                'cutout_probability': 0.4,
+                'use_frequency_mask': True,     # 新增频域掩码
+                'freq_mask_ratio': 0.2,
+                # ECG特有增强
+                'use_baseline_wander': True,
+                'bw_amplitude': 0.03,
+                'use_powerline_noise': True,
+                'pl_amplitude': 0.015
+            }
         )
         val_dataset = FoldDataset(
-            list(val_subset), self.base_path, is_train=False, augment=False
+            list(val_subset),
+            base_path=self.base_path,
+            is_train=False,
+            augment=False
         )
         
         # 创建数据加载器
@@ -452,6 +816,10 @@ class ModelTrainer:
             val_dataset, batch_size=self.batch_size, 
             shuffle=False, num_workers=0
         )
+
+        # 计算正类权重（处理不平衡）
+        pos_weight = self._calculate_pos_weight(train_loader)
+        print(f"正类权重: {pos_weight.item():.2f}")
         
         # 初始化模型
         model = Mscnn(
@@ -462,13 +830,17 @@ class ModelTrainer:
             stream2_first_kernel=self.kernel_config['stream2_first_kernel']
         ).to(device)
         
-        # 损失函数和优化器
-        criterion = torch.nn.BCELoss()
+        criterion = self._create_criterion(pos_weight, device)
         optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
+        
+        # 创建学习率调度器
+        scheduler = self._create_lr_scheduler(optimizer, num_epochs, train_loader)
         
         # 训练循环
         train_losses = []
         train_accs = []
+        train_aucs = []
+        train_f1s = []
         val_losses = []
         val_accs = []
         val_aucs = []
@@ -484,10 +856,10 @@ class ModelTrainer:
         early_stop_counter = 0
         
         for epoch in range(1, num_epochs + 1):
-            # 训练
+            # 训练阶段
             model.train()
-            train_loss = 0.0
-            train_preds = []
+            epoch_train_loss = 0.0
+            train_probs = []
             train_labels = []
             
             for x, y in train_loader:
@@ -501,24 +873,35 @@ class ModelTrainer:
                 loss.backward()
                 optimizer.step()
                 
-                train_loss += loss.item()
+                epoch_train_loss += loss.item()
                 
-                # 收集预测结果
-                preds = (outputs.detach().cpu().numpy() >= 0.5).astype(int)
-                train_preds.extend(preds.flatten())
+                # 收集概率和标签（用于后续计算指标）
+                probs = torch.sigmoid(outputs)
+                train_probs.extend(probs.detach().cpu().numpy().flatten())
                 train_labels.extend(y.detach().cpu().numpy().flatten())
             
-            # 计算训练指标
-            avg_train_loss = train_loss / len(train_loader)
-            train_acc = accuracy_score(train_labels, train_preds)
+            # 使用新函数计算训练集指标
+            train_metrics = self._calculate_training_metrics(model, train_loader, criterion, device)
+            
+            avg_train_loss = epoch_train_loss / len(train_loader)
+            train_acc = train_metrics['acc']
+            train_auc = train_metrics['auc']
+            train_f1 = train_metrics['f1']
+            train_threshold = train_metrics['threshold']
             
             train_losses.append(avg_train_loss)
             train_accs.append(train_acc)
+            train_aucs.append(train_auc)
+            train_f1s.append(train_f1)
             
-            # 验证
-            val_loss, val_acc, val_auc, val_labels, val_probs, val_precision, val_recall, val_f1 = self._validate_model(
-                model, criterion, val_loader
-            )
+            # 验证阶段
+            val_res = self._validate_model(model, val_loader, criterion, device)
+            
+            val_loss = val_res['loss']
+            val_acc = val_res['acc']
+            val_auc = val_res['auc']
+            val_f1 = val_res['f1']
+            val_threshold = val_res['threshold']
             
             val_losses.append(val_loss)
             val_accs.append(val_acc)
@@ -533,6 +916,16 @@ class ModelTrainer:
             }
             composite_score, breakdown = CompositeScoreCalculator.calculate_composite_score(val_metrics)
             
+            # 更新学习率调度器
+            if scheduler is not None:
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(composite_score)
+                else:
+                    scheduler.step()
+            
+            # 记录当前学习率
+            current_lr = optimizer.param_groups[0]['lr']
+            
             # 检查是否是最佳模型
             is_best = False
             if composite_score > best_composite_score + MIN_DELTA:
@@ -543,7 +936,7 @@ class ModelTrainer:
                 best_val_f1 = val_f1
                 best_epoch = epoch
                 best_model_state = model.state_dict().copy()
-                early_stop_counter = 0  # 重置早停计数器
+                early_stop_counter = 0
             else:
                 early_stop_counter += 1
             
@@ -551,12 +944,12 @@ class ModelTrainer:
             if train_acc > best_train_acc:
                 best_train_acc = train_acc
             
-            # 打印进度
+            # 打印进度 - 现在显示训练集和验证集的阈值
             if epoch % 5 == 0 or epoch == 1 or epoch == num_epochs:
                 print(f"  Epoch {epoch}/{num_epochs}:")
-                print(f"    训练 - Loss: {avg_train_loss:.4f}, Acc: {train_acc:.4f}")
-                print(f"    验证 - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, AUC: {val_auc:.4f}, F1: {val_f1:.4f}")
-                print(f"    综合评分: {composite_score:.4f}")
+                print(f"    训练 - Loss: {avg_train_loss:.4f}, Acc: {train_acc:.4f}, AUC: {train_auc:.4f}, F1: {train_f1:.4f}, 阈值: {train_threshold:.3f}")
+                print(f"    验证 - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, AUC: {val_auc:.4f}, F1: {val_f1:.4f}, 阈值: {val_threshold:.3f}")
+                print(f"    综合评分: {composite_score:.4f}, 学习率: {current_lr:.2e}")
             
             # 早停检查
             if early_stop_counter >= EARLY_STOP_PATIENCE:
@@ -564,6 +957,7 @@ class ModelTrainer:
                 break
         
         print(f"  最佳验证综合评分: {best_composite_score:.4f} (Epoch {best_epoch})")
+        print(f"  最终学习率: {optimizer.param_groups[0]['lr']:.2e}")
         
         # 加载最佳模型状态
         if best_model_state:
@@ -587,7 +981,10 @@ class ModelTrainer:
                 'avg_train_loss': np.mean(train_losses),
                 'num_epochs': epoch,  # 实际训练的epoch数（可能因早停而小于num_epochs）
                 'best_epoch': best_epoch,
-                'early_stopped': early_stop_counter >= EARLY_STOP_PATIENCE
+                'early_stopped': early_stop_counter >= EARLY_STOP_PATIENCE,
+                'final_lr': optimizer.param_groups[0]['lr'],  # 保存最终学习率
+                'pos_weight': pos_weight.item(),  # 保存正类权重
+                'lr_scheduler_type': self.lr_scheduler_config.get('scheduler_type', 'plateau')
             }
             self.file_manager.save_model(model, model_path, metadata)
         
@@ -603,7 +1000,9 @@ class ModelTrainer:
             'avg_val_loss': np.mean(val_losses),
             'best_epoch': best_epoch,
             'total_epochs': epoch,
-            'early_stopped': early_stop_counter >= EARLY_STOP_PATIENCE
+            'early_stopped': early_stop_counter >= EARLY_STOP_PATIENCE,
+            'final_lr': optimizer.param_groups[0]['lr'],
+            'pos_weight': pos_weight.item()
         }
         
         # 保存训练指标
@@ -613,8 +1012,67 @@ class ModelTrainer:
         
         return model, train_metrics
     
+    def test_basic_functionality(self):
+        """测试基本功能，确认没有实现错误"""
+        print("\n=== 基本功能测试 ===")
+        
+        # 1. 加载少量数据
+        test_indices = [0]  # 只使用CV0
+        test_data = self.data_manager.load_cv_files(test_indices)
+        
+        if len(test_data) == 0:
+            print("错误: 测试数据为空")
+            return
+        
+        # 只取前100个样本
+        test_data = test_data[:100]
+        
+        # 2. 创建简单的模型
+        model = Mscnn(
+            INPUT_CHANNELS,
+            OUTPUT_CLASSES,
+            use_stream2=self.use_stream2,
+            stream1_kernel=self.kernel_config['stream1_kernel'],
+            stream2_first_kernel=self.kernel_config['stream2_first_kernel']
+        ).to(device)
+        
+        # 3. 创建数据集和加载器
+        test_dataset = FoldDataset(
+            test_data, self.base_path, is_train=False, augment=False
+        )
+        test_loader = DataLoader(
+            test_dataset, batch_size=1, shuffle=False, num_workers=0
+        )
+        
+        # 4. 测试前向传播
+        model.eval()
+        sample_count = 0
+        with torch.no_grad():
+            for x, y in test_loader:
+                x = x.to(device).float()
+                x = x.view(-1, 1, FIXED_LENGTH)
+                y = y.to(device).float()
+                
+                outputs = model(x)
+                probs = torch.sigmoid(outputs)
+                
+                # 打印前几个样本的信息
+                if sample_count < 5:
+                    print(f"样本 {sample_count}:")
+                    print(f"  输入形状: {x.shape}")
+                    print(f"  标签: {y.cpu().numpy()[0][0]:.1f}")
+                    print(f"  输出logits: {outputs.cpu().numpy()[0][0]:.4f}")
+                    print(f"  概率: {probs.cpu().numpy()[0][0]:.4f}")
+                    print()
+                
+                sample_count += 1
+                if sample_count >= 10:
+                    break
+        
+        print(f"测试完成，处理了 {sample_count} 个样本")
+    
     def _train_single_fold(self, train_data, val_data, fold_idx, num_epochs, save_model=True, min_epochs=10):
-        """训练单个折，包含早停机制"""
+        """训练单个折，包含早停机制（简化输出版本）"""
         # 创建数据集
         train_dataset = FoldDataset(
             train_data, self.base_path, is_train=True, augment=self.augment
@@ -629,8 +1087,12 @@ class ModelTrainer:
             shuffle=True, num_workers=0
         )
         val_loader = DataLoader(
-            val_dataset, batch_size=1, shuffle=False, num_workers=0
+            val_dataset, batch_size=self.batch_size,  # 使用相同批次大小
+            shuffle=False, num_workers=0
         )
+        
+        # 计算正类权重
+        pos_weight = self._calculate_pos_weight(train_loader)
         
         # 初始化模型
         model = Mscnn(
@@ -641,9 +1103,11 @@ class ModelTrainer:
             stream2_first_kernel=self.kernel_config['stream2_first_kernel']
         ).to(device)
         
-        # 损失函数和优化器
-        criterion = torch.nn.BCELoss()
+        criterion = self._create_criterion(pos_weight, device)
         optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
+        
+        # 创建学习率调度器
+        scheduler = self._create_lr_scheduler(optimizer, num_epochs, train_loader)
         
         # 训练状态
         best_val_acc = 0
@@ -654,45 +1118,23 @@ class ModelTrainer:
         best_model_state = None
         early_stop_counter = 0
         
-        # 用于可视化的历史记录
-        train_losses = []
-        train_accs = []
-        val_losses = []
-        val_accs = []
-        val_aucs = []
-        val_f1s = []
-
-        # 创建epoch进度条
+        # 创建简洁的epoch进度条
         epoch_pbar = tqdm(
-            range(1, num_epochs + 1),
+            range(1, num_epochs + 1), 
             desc=f"折 {fold_idx+1} 训练进度",
+            bar_format='{desc}: {percentage:3.0f}%|{bar:20}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
             position=0,
-            leave=True,
-            dynamic_ncols=True,
-            mininterval=1.0
+            leave=False
         )
-
+        
         # 训练循环
         for epoch in epoch_pbar:
-            # 训练
+            # 训练阶段
             model.train()
             train_loss = 0.0
-            train_preds = []
-            train_labels = []
             
-            # 创建批次进度条 - 使用不同的position
-            batch_pbar = tqdm(
-                enumerate(train_loader, 1),
-                total=len(train_loader),
-                desc="批次训练",
-                position=1,
-                leave=False,
-                dynamic_ncols=True,
-                mininterval=0.5,
-                maxinterval=1.0,
-                bar_format='{l_bar}{bar:30}{r_bar}{bar:-30b}'
-            )
-            for batch_idx, (x, y) in batch_pbar:
+            # 批次训练（不显示内部批次信息）
+            for x, y in train_loader:
                 x = x.to(device).float()
                 x = x.view(-1, 1, FIXED_LENGTH)
                 y = y.to(device).float()
@@ -704,78 +1146,70 @@ class ModelTrainer:
                 optimizer.step()
                 
                 train_loss += loss.item()
-                
-                # 收集预测结果
-                preds = (outputs.detach().cpu().numpy() >= 0.5).astype(int)
-                train_preds.extend(preds.flatten())
-                train_labels.extend(y.detach().cpu().numpy().flatten())
-
-                # 更新批次进度条 - 使用更详细的格式
-                avg_loss_so_far = train_loss / batch_idx
-                batch_pbar.set_postfix({
-                    'batch': f'{batch_idx}/{len(train_loader)}',
-                    'loss': f'{loss.item():.4f}',
-                    'avg_loss': f'{avg_loss_so_far:.4f}'
-                })
-
-            batch_pbar.close()
             
-            # 计算训练准确率
-            train_acc = accuracy_score(train_labels, train_preds)
+            # 计算训练集指标（静默模式）
+            train_metrics = self._calculate_training_metrics(model, train_loader, criterion, device)
             avg_train_loss = train_loss / len(train_loader)
-
-            train_losses.append(avg_train_loss)
-            train_accs.append(train_acc)
             
-            # 验证 - 修复这里的解包问题
-            val_metrics = self._validate_model(model, criterion, val_loader)
-            val_loss, val_acc, val_auc, _, _, val_precision, val_recall, val_f1 = val_metrics
-
-            val_losses.append(val_loss)
-            val_accs.append(val_acc)
-            val_aucs.append(val_auc)
-            val_f1s.append(val_f1)
+            # 验证阶段（静默模式）
+            val_res = self._validate_model(model, val_loader, criterion, device)
             
             # 计算综合评分
             val_metrics_dict = {
-                'accuracy': val_acc,
-                'auc': val_auc,
-                'f1': val_f1
+                'accuracy': val_res['acc'],
+                'auc': val_res['auc'],
+                'f1': val_res['f1']
             }
-            composite_score, breakdown = CompositeScoreCalculator.calculate_composite_score(val_metrics_dict)
+            composite_score, _ = CompositeScoreCalculator.calculate_composite_score(val_metrics_dict)
+            
+            # 更新学习率调度器
+            if scheduler is not None:
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(val_res['loss'])  # 使用验证损失
+                else:
+                    scheduler.step()
+            
+            # 记录当前学习率
+            current_lr = optimizer.param_groups[0]['lr']
             
             # 检查是否是最佳模型
             is_best = False
-            if composite_score > best_composite_score + MIN_DELTA:
-                is_best = True
-                best_composite_score = composite_score
-                best_val_acc = val_acc
-                best_val_auc = val_auc
-                best_val_f1 = val_f1
-                best_epoch = epoch
-                best_model_state = model.state_dict().copy()
-                early_stop_counter = 0  # 重置早停计数器
+            if composite_score > best_composite_score:
+                if composite_score >= best_composite_score + MIN_DELTA:
+                    is_best = True
+                    best_composite_score = composite_score
+                    best_val_acc = val_res['acc']
+                    best_val_auc = val_res['auc']
+                    best_val_f1 = val_res['f1']
+                    best_epoch = epoch
+                    best_model_state = model.state_dict().copy()
+                    early_stop_counter = 0
+                else:
+                    early_stop_counter += 1
             else:
                 early_stop_counter += 1
-
-            # 更新epoch进度条
+            
+            # 更新进度条显示
             epoch_pbar.set_postfix({
-                'train_loss': avg_train_loss,
-                'train_acc': train_acc,
-                'val_acc': val_acc,
-                'val_f1': val_f1,
-                'best': '★' if is_best else ''
+                'loss': f"{avg_train_loss:.3f}",
+                'val_acc': f"{val_res['acc']:.3f}",
+                'val_f1': f"{val_res['f1']:.3f}",
+                'lr': f"{current_lr:.1e}"
             })
-            epoch_pbar.update(1)
+            
+            # 每5个epoch或最后一个epoch显示详细信息
+            if epoch % 5 == 0 or epoch == 1 or epoch == num_epochs:
+                print(f"    Epoch {epoch:3d}/{num_epochs}: "
+                    f"训练损失={avg_train_loss:.4f}, 准确率={train_metrics['acc']:.4f} | "
+                    f"验证准确率={val_res['acc']:.4f}, F1={val_res['f1']:.4f} | "
+                    f"学习率={current_lr:.2e}" + (" ★" if is_best else ""))
             
             # 早停检查（至少训练min_epochs个epoch）
             if epoch >= min_epochs and early_stop_counter >= EARLY_STOP_PATIENCE:
-                print(f"    ⏹️ 早停触发于epoch {epoch}")
+                print(f"    ⏹️  早停触发于epoch {epoch}，连续{EARLY_STOP_PATIENCE}个epoch验证集无显著提升")
                 break
-
-        epoch_pbar.close()
         
-        print(f"  最佳验证综合评分: {best_composite_score:.4f} (Epoch {best_epoch})")
+        epoch_pbar.close()
         
         # 加载最佳模型状态
         if best_model_state:
@@ -798,7 +1232,10 @@ class ModelTrainer:
                 'val_f1': best_val_f1,
                 'composite_score': best_composite_score,
                 'epoch': best_epoch,
-                'early_stopped': early_stop_counter >= EARLY_STOP_PATIENCE
+                'early_stopped': early_stop_counter >= EARLY_STOP_PATIENCE,
+                'pos_weight': pos_weight.item(),
+                'final_lr': optimizer.param_groups[0]['lr'],
+                'lr_scheduler_type': self.lr_scheduler_config.get('scheduler_type', 'plateau')
             }
             self.file_manager.save_model(model, model_path, metadata)
         
@@ -814,33 +1251,90 @@ class ModelTrainer:
         }
         
         return fold_result, model
+
     
-    def _validate_model(self, model, criterion, val_loader):
-        """验证模型"""
+    def _calculate_pos_weight(self, dataloader):
+        """计算正类权重"""
+        if self.use_focal_loss:
+            # Focal Loss不使用pos_weight，返回None或默认值
+            print(f"⚠️ Focal Loss不使用pos_weight，将忽略此参数")
+            return torch.tensor([1.0], dtype=torch.float32).to(device)
+
+
+        all_labels = []
+        for _, y in dataloader:
+            all_labels.extend(y.numpy().flatten())
+        
+        all_labels = np.array(all_labels, dtype=int)
+        class_counts = np.bincount(all_labels, minlength=2)
+        
+        # 计算正类比例
+        total_samples = np.sum(class_counts)
+        positive_ratio = class_counts[1] / total_samples
+        negative_ratio = class_counts[0] / total_samples
+        
+        print(f"类别分布: 负类={class_counts[0]}, 正类={class_counts[1]}, 正类比例={positive_ratio:.2%}")
+
+        # if positive_ratio < 0.2:  # 正类比例低于20%
+        #     # 使用2-5之间的权重，而不是10.39
+        #     adjusted_weight = min(5.0, max(2.0, 1.0 / positive_ratio))
+        # else:
+        #     adjusted_weight = 1.0
+
+        # 方法1: 基于逆频率（当前1:10.6比例）
+        raw_weight = class_counts[0] / class_counts[1]  # 约10.6
+        adjusted_weight = min(8.0, max(3.0, raw_weight * 0.6))
+    
+        
+        pos_weight = torch.tensor([adjusted_weight], dtype=torch.float32)
+        
+        print(f"使用正类权重: {adjusted_weight:.2f} (原始权重: {class_counts[0]/class_counts[1] if class_counts[1] > 0 else 0:.2f})")
+        
+        return pos_weight.to(device)
+    
+    def _validate_model(self, model, val_loader, criterion, device):
+        """验证模型（兼容BCE和Focal Loss）"""
         model.eval()
-        running_loss = 0.0
+        val_loss = 0.0
         all_probs = []
         all_labels = []
         
         with torch.no_grad():
-            for x, y in val_loader:
-                x = x.to(device).float()
-                x = x.view(-1, 1, FIXED_LENGTH)
-                y = y.to(device).float()
+            for inputs, labels in val_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs)
                 
-                probs = model(x)
-                loss = criterion(probs, y)
-                running_loss += loss.item()
+                # 统一维度
+                if labels.dim() == 1:
+                    labels = labels.unsqueeze(1)
                 
-                all_probs.extend(probs.cpu().numpy().flatten())
-                all_labels.extend(y.cpu().numpy().flatten())
+                # 计算损失
+                if isinstance(criterion, (FocalLoss, WeightedFocalLoss)):
+                    # Focal Loss需要特殊处理
+                    loss = criterion(outputs, labels.float())
+                else:
+                    loss = criterion(outputs, labels.float())
+                
+                val_loss += loss.item()
+                
+                # 获取概率
+                probs = torch.sigmoid(outputs)
+                all_probs.extend(probs.cpu().numpy().flatten().tolist())
+                all_labels.extend(labels.cpu().numpy().flatten().tolist())
         
-        # 计算指标
-        avg_loss = running_loss / len(val_loader)
+        avg_val_loss = val_loss / len(val_loader)
         all_probs = np.array(all_probs)
         all_labels = np.array(all_labels)
         
-        preds = (all_probs >= 0.5).astype(int)
+        # 静默处理标签转换
+        if all_labels.dtype != np.int64 and all_labels.dtype != np.int32:
+            all_labels = np.round(all_labels).astype(int)
+        
+        # 寻找最优阈值
+        best_threshold, best_f1, _, _ = self._find_optimal_threshold(all_labels, all_probs)
+        
+        # 基于最优阈值计算准确率
+        preds = (all_probs >= best_threshold).astype(int)
         acc = accuracy_score(all_labels, preds)
         
         try:
@@ -848,17 +1342,15 @@ class ModelTrainer:
         except:
             auc = 0.5
         
-        try:
-            precision = precision_score(all_labels, preds, average='binary', zero_division=0)
-            recall = recall_score(all_labels, preds, average='binary', zero_division=0)
-            f1 = f1_score(all_labels, preds, average='binary', zero_division=0)
-        except:
-            precision = 0.0
-            recall = 0.0
-            f1 = 0.0
-        
-        model.train()
-        return avg_loss, acc, auc, all_labels, all_probs, precision, recall, f1
+        return {
+            'loss': avg_val_loss,
+            'acc': acc,
+            'auc': auc,
+            'f1': best_f1,
+            'threshold': best_threshold,
+            'probs': all_probs,
+            'labels': all_labels
+        }
     
     def _compute_average_metrics(self, fold_results):
         if not fold_results:
@@ -886,15 +1378,16 @@ class ModelTrainer:
             'num_folds': len(fold_results)
         }
     
-    def evaluate_on_test_set(self, test_cv_indices, model, save_results=True):
-        """在测试集上评估模型"""
+    def evaluate_on_test_set(self, test_cv_indices, model, save_results=True, 
+                        optimize_threshold=True, use_two_stage=True):
+        """在测试集上评估模型，可选阈值优化"""
         print(f"\n在测试集上评估模型")
         print(f"测试集: CV{', '.join(map(str, test_cv_indices))}")
         
         # 加载测试集数据
         test_data = self.data_manager.load_cv_files(test_cv_indices)
         if len(test_data) == 0:
-            print("错误: 测试集数据为空")
+            print("错误: 测试集数据为空")   
             return {}
         
         # 创建数据集
@@ -907,13 +1400,139 @@ class ModelTrainer:
             test_dataset, batch_size=1, shuffle=False, num_workers=0
         )
         
-        # 评估
-        criterion = torch.nn.BCELoss()
-        test_loss, test_acc, test_auc, _, _, test_precision, test_recall, test_f1 = self._validate_model(
-            model, criterion, test_loader
-        )
+        # ==================== 修复：创建一致的损失函数 ====================
+        if self.use_focal_loss:
+            # 使用与训练相同的Focal Loss参数
+            if self.focal_alpha is not None:
+                criterion = FocalLoss(
+                    alpha=self.focal_alpha,
+                    gamma=self.focal_gamma,
+                    reduction='mean',
+                    logits=True
+                ).to(device)
+                print(f"评估使用Focal Loss: alpha={self.focal_alpha}, gamma={self.focal_gamma}")
+            else:
+                criterion = WeightedFocalLoss(
+                    pos_weight=None,
+                    gamma=self.focal_gamma,
+                    reduction='mean',
+                    logits=True
+                ).to(device)
+                print(f"评估使用WeightedFocalLoss: gamma={self.focal_gamma}")
+        else:
+            # 使用BCEWithLogitsLoss
+            criterion = torch.nn.BCEWithLogitsLoss().to(device)
+            print(f"评估使用BCEWithLogitsLoss")
         
-        # 计算综合评分
+        # 评估 - 获取原始概率
+        test_res = self._validate_model(model, test_loader, criterion, device)
+
+        test_probs = test_res['probs']
+        test_labels = test_res['labels']
+        test_loss = test_loss_corrected = test_res['loss']  # 保持一致性
+        test_auc = test_res['auc']
+        test_f1 = test_res['f1']
+        
+        # ==================== 修复：初始化所有需要的变量 ====================
+        best_threshold = 0.5  # 默认值
+        test_acc = 0.0
+        test_precision = 0.0
+        test_recall = 0.0
+        test_f1 = 0.0
+        two_stage_used = False
+        stage1_threshold = 0.4
+        stage2_threshold = 0.72
+        
+        # 打印调试信息
+        print(f"测试集标签类型: {test_labels.dtype}, 形状: {test_labels.shape}")
+        print(f"测试集标签唯一值: {np.unique(test_labels)}")
+        print(f"测试集样本数: {len(test_labels)}")
+        print(f"类别分布 - 正类: {np.sum(test_labels)}, 负类: {len(test_labels) - np.sum(test_labels)}")
+        print(f"测试损失 (使用训练一致的损失函数): {test_loss_corrected:.6f}")
+        
+        # ==================== 两阶段阈值策略 ====================
+        if use_two_stage:
+            print("\n使用两阶段阈值策略...")
+            two_stage_used = True
+            
+            # 获取单阶段最优阈值作为第二阶段阈值
+            if optimize_threshold:
+                stage2_threshold, _, _, _ = self._find_optimal_threshold(
+                    test_labels, test_probs, metric='f1'
+                )
+                print(f"第二阶段使用单阶段最优阈值: {stage2_threshold:.3f}")
+            else:
+                stage2_threshold = 0.72
+                print(f"第二阶段使用默认阈值: {stage2_threshold:.3f}")
+            
+            # 第一阶段：低阈值获取高召回
+            stage1_preds = (test_probs >= stage1_threshold).astype(int)
+            stage1_recall = recall_score(test_labels, stage1_preds, zero_division=0)
+            print(f"第一阶段阈值={stage1_threshold}, 召回率={stage1_recall:.4f}")
+            
+            # 第二阶段：只对第一阶段预测为正的样本
+            stage1_pos_indices = np.where(stage1_preds == 1)[0]
+            
+            if len(stage1_pos_indices) > 0:
+                stage1_pos_probs = test_probs[stage1_pos_indices]
+                stage2_pos_preds = (stage1_pos_probs >= stage2_threshold).astype(int)
+                
+                # 合并结果
+                final_preds = stage1_preds.copy()
+                final_preds[stage1_pos_indices] = stage2_pos_preds
+                
+                print(f"第一阶段预测为正的样本数: {len(stage1_pos_indices)}")
+                print(f"第二阶段过滤后保留的样本数: {np.sum(stage2_pos_preds)}")
+            else:
+                final_preds = stage1_preds
+                print("⚠️ 第一阶段没有预测为正的样本")
+            
+            # 计算指标
+            test_acc = accuracy_score(test_labels, final_preds)
+            test_precision = precision_score(test_labels, final_preds, average='binary', zero_division=0)
+            test_recall = recall_score(test_labels, final_preds, average='binary', zero_division=0)
+            test_f1 = f1_score(test_labels, final_preds, average='binary', zero_division=0)
+            
+            # 对于两阶段，我们使用第二阶段阈值作为best_threshold的代表
+            best_threshold = stage2_threshold
+            
+            print(f"两阶段阈值策略结果:")
+            print(f"  最终召回率: {test_recall:.4f} (相比第一阶段: {test_recall-stage1_recall:+.4f})")
+            print(f"  最终F1: {test_f1:.4f}")
+        
+        # ==================== 单阶段阈值优化 ====================
+        else:
+            print("\n使用单阶段阈值策略...")
+            two_stage_used = False
+            
+            # 如果需要阈值优化
+            if optimize_threshold:
+                print("执行单阶段阈值优化...")
+                best_threshold, best_f1, best_precision, best_recall = self._find_optimal_threshold(
+                    test_labels, test_probs, metric='f1'
+                )
+                
+                # 使用最佳阈值重新计算预测
+                best_preds = (test_probs >= best_threshold).astype(int)
+                
+                # 计算使用最佳阈值后的指标
+                test_acc = accuracy_score(test_labels, best_preds)
+                test_precision = precision_score(test_labels, best_preds, average='binary', zero_division=0)
+                test_recall = recall_score(test_labels, best_preds, average='binary', zero_division=0)
+                test_f1 = f1_score(test_labels, best_preds, average='binary', zero_division=0)
+                
+                print(f"最优阈值: {best_threshold:.3f} (默认: 0.5)")
+                print(f"阈值优化后 F1 分数: {test_f1:.4f}")
+            else:
+                best_threshold = 0.5
+                best_preds = (test_probs >= 0.5).astype(int)
+                test_acc = accuracy_score(test_labels, best_preds)
+                test_precision = precision_score(test_labels, best_preds, average='binary', zero_division=0)
+                test_recall = recall_score(test_labels, best_preds, average='binary', zero_division=0)
+                test_f1 = f1_score(test_labels, best_preds, average='binary', zero_division=0)
+                print(f"使用默认阈值: {best_threshold}")
+        
+        # ==================== 计算综合评分 ====================
         test_metrics = {
             'accuracy': test_acc,
             'auc': test_auc,
@@ -921,6 +1540,7 @@ class ModelTrainer:
         }
         test_composite_score, breakdown = CompositeScoreCalculator.calculate_composite_score(test_metrics)
         
+        # ==================== 构建结果字典 ====================
         test_results = {
             'test_acc': test_acc,
             'test_auc': test_auc,
@@ -928,81 +1548,379 @@ class ModelTrainer:
             'test_recall': test_recall,
             'test_f1': test_f1,
             'test_composite_score': test_composite_score,
-            'test_loss': test_loss,
+            'test_loss': test_loss_corrected,  # 使用修正后的损失
             'evaluation_time': datetime.now().isoformat(),
-            'score_breakdown': breakdown
+            'score_breakdown': breakdown,
+            'optimal_threshold': best_threshold,
+            'threshold_strategy': 'two_stage' if two_stage_used else ('optimized' if optimize_threshold else 'default'),
+            'class_distribution': self._get_class_distribution(test_labels)
         }
         
-        print(f"测试集结果:")
+        # 添加两阶段特定信息
+        if two_stage_used:
+            test_results.update({
+                'two_stage_used': True,
+                'stage1_threshold': stage1_threshold,
+                'stage2_threshold': stage2_threshold,
+                'stage1_recall': stage1_recall if 'stage1_recall' in locals() else 0.0
+            })
+        else:
+            test_results['two_stage_used'] = False
+        
+        # ==================== 打印结果 ====================
+        print(f"\n测试集结果:")
+        print(f"  阈值策略: {'两阶段' if two_stage_used else '单阶段' + (' (优化)' if optimize_threshold else ' (默认)')}")
+        if two_stage_used:
+            print(f"  第一阶段阈值: {stage1_threshold:.3f}")
+            print(f"  第二阶段阈值: {stage2_threshold:.3f}")
+        else:
+            print(f"  阈值: {best_threshold:.3f}")
         print(f"  准确率: {test_acc:.4f}")
         print(f"  AUC: {test_auc:.4f}")
         print(f"  精确率: {test_precision:.4f}")
         print(f"  召回率: {test_recall:.4f}")
         print(f"  F1分数: {test_f1:.4f}")
         print(f"  综合评分: {test_composite_score:.4f}")
-        print(f"  损失: {test_loss:.4f}")
+        print(f"  损失: {test_loss_corrected:.4f}")
+        print(f"  类别分布: {test_results['class_distribution']}")
         
-        # 保存评估结果
+        # ==================== 保存评估结果 ====================
         if save_results and self.experiment_dir:
             results_path = os.path.join(self.experiment_dir, "metrics", "test_evaluation.json")
             self.file_manager.save_metrics(test_results, results_path)
+            print(f"💾 测试结果已保存: {results_path}")
         
         return test_results
-    
+
+    def _find_optimal_threshold(self, labels, probs, metric='f1'):
+        """寻找最优阈值"""
+        # 确保 labels 是整数类型
+        labels = np.array(labels)
+        probs = np.array(probs)
+        
+        # 静默处理标签转换
+        if labels.dtype != np.int64 and labels.dtype != np.int32:
+            # 通过四舍五入将浮点数转换为0/1
+            labels = np.round(labels).astype(int)
+        
+        # 确保 probs 在0-1范围内
+        if np.min(probs) < 0 or np.max(probs) > 1:
+            probs = np.clip(probs, 0, 1)
+        
+        best_threshold = 0.5
+        best_score = 0
+        best_precision = 0
+        best_recall = 0
+        
+        # 尝试多个阈值
+        thresholds = np.linspace(0.1, 0.9, 81)
+        
+        for threshold in thresholds:
+            preds = (probs >= threshold).astype(int)
+            
+            try:
+                if metric == 'f1':
+                    score = f1_score(labels, preds, zero_division=0)
+                elif metric == 'balanced_accuracy':
+                    score = balanced_accuracy_score(labels, preds)
+                else:
+                    score = f1_score(labels, preds, zero_division=0)
+            except:
+                score = 0
+            
+            if score > best_score:
+                best_score = score
+                best_threshold = threshold
+        
+        # 使用最优阈值计算最终指标
+        best_preds = (probs >= best_threshold).astype(int)
+        best_precision = precision_score(labels, best_preds, zero_division=0)
+        best_recall = recall_score(labels, best_preds, zero_division=0)
+        best_f1 = f1_score(labels, best_preds, zero_division=0)
+        
+        return best_threshold, best_f1, best_precision, best_recall
+
+
+    def _calculate_training_metrics(self, model, train_loader, criterion, device):
+        """计算训练集指标（与验证集相同的评估方式）"""
+        model.eval()  # 设置为评估模式
+        train_loss = 0.0
+        all_probs = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for x, y in train_loader:
+                x = x.to(device).float()
+                x = x.view(-1, 1, FIXED_LENGTH)
+                y = y.to(device).float()
+                
+                outputs = model(x)
+                loss = criterion(outputs, y)
+                train_loss += loss.item()
+                
+                probs = torch.sigmoid(outputs)
+                all_probs.extend(probs.cpu().numpy().flatten().tolist())
+                all_labels.extend(y.cpu().numpy().flatten().tolist())
+        
+        avg_train_loss = train_loss / len(train_loader)
+        all_probs = np.array(all_probs)
+        all_labels = np.array(all_labels)
+        
+        # 使用与验证集相同的阈值计算方法
+        best_threshold, best_f1, _, _ = self._find_optimal_threshold(all_labels, all_probs)
+        
+        # 使用最优阈值计算预测
+        preds = (all_probs >= best_threshold).astype(int)
+        train_acc = accuracy_score(all_labels, preds)
+        
+        try:
+            train_auc = roc_auc_score(all_labels, all_probs)
+        except:
+            train_auc = 0.5
+        
+        return {
+            'loss': avg_train_loss,
+            'acc': train_acc,
+            'auc': train_auc,
+            'f1': best_f1,
+            'threshold': best_threshold,
+            'probs': all_probs,
+            'labels': all_labels
+        }
+
+    def _get_class_distribution(self, labels):
+        """获取类别分布"""
+        labels = np.array(labels)
+        total = len(labels)
+        positive = np.sum(labels)
+        negative = total - positive
+        
+        return {
+            'total': int(total),
+            'positive': int(positive),
+            'negative': int(negative),
+            'positive_ratio': float(positive / total),
+            'negative_ratio': float(negative / total)
+        }
+        
     def _visualize_cv_results(self, fold_results, avg_metrics):
-        """可视化交叉验证结果"""
+        """Visualize cross-validation results (English labels)"""
         if not self.experiment_dir:
             return
         
-        # 绘制各折性能对比
+        # Extract fold performance metrics
         fold_accs = [r['best_val_acc'] for r in fold_results]
         fold_aucs = [r['best_val_auc'] for r in fold_results]
         fold_f1s = [r['best_val_f1'] for r in fold_results]
         
-        # 创建子图
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        # Create subplots
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle('Cross-Validation Performance Analysis', fontsize=16, fontweight='bold')
         
-        # 各折准确率
-        axes[0].bar(range(1, len(fold_accs) + 1), fold_accs, color='skyblue', edgecolor='black')
-        axes[0].axhline(y=avg_metrics['avg_val_acc'], color='red', linestyle='--', 
-                       label=f'平均值: {avg_metrics["avg_val_acc"]:.4f}')
-        axes[0].set_title('各折验证准确率', fontsize=14, fontweight='bold')
-        axes[0].set_xlabel('折数', fontsize=12)
-        axes[0].set_ylabel('准确率', fontsize=12)
-        axes[0].set_xticks(range(1, len(fold_accs) + 1))
-        axes[0].legend()
-        axes[0].grid(True, alpha=0.3, axis='y')
+        # 1. Bar chart of fold accuracies
+        axes[0, 0].bar(range(1, len(fold_accs) + 1), fold_accs, 
+                    color='skyblue', edgecolor='black', alpha=0.8)
+        axes[0, 0].axhline(y=avg_metrics['avg_val_acc'], color='red', linestyle='--', 
+                        linewidth=2, label=f'Mean: {avg_metrics["avg_val_acc"]:.4f}')
+        axes[0, 0].set_title('Validation Accuracy per Fold', fontsize=14, fontweight='bold')
+        axes[0, 0].set_xlabel('Fold Number', fontsize=12)
+        axes[0, 0].set_ylabel('Accuracy', fontsize=12)
+        axes[0, 0].set_xticks(range(1, len(fold_accs) + 1))
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3, axis='y')
         
-        # 各折AUC
-        axes[1].bar(range(1, len(fold_aucs) + 1), fold_aucs, color='lightgreen', edgecolor='black')
-        axes[1].axhline(y=avg_metrics['avg_val_auc'], color='red', linestyle='--', 
-                       label=f'平均值: {avg_metrics["avg_val_auc"]:.4f}')
-        axes[1].set_title('各折AUC分数', fontsize=14, fontweight='bold')
-        axes[1].set_xlabel('折数', fontsize=12)
-        axes[1].set_ylabel('AUC', fontsize=12)
-        axes[1].set_xticks(range(1, len(fold_aucs) + 1))
-        axes[1].legend()
-        axes[1].grid(True, alpha=0.3, axis='y')
+        # Add value labels on bars
+        for i, acc in enumerate(fold_accs):
+            axes[0, 0].text(i + 1, acc + 0.005, f'{acc:.3f}', 
+                        ha='center', va='bottom', fontsize=9)
         
-        # 各折F1分数
-        axes[2].bar(range(1, len(fold_f1s) + 1), fold_f1s, color='lightcoral', edgecolor='black')
-        axes[2].axhline(y=avg_metrics['avg_val_f1'], color='red', linestyle='--', 
-                       label=f'平均值: {avg_metrics["avg_val_f1"]:.4f}')
-        axes[2].set_title('各折F1分数', fontsize=14, fontweight='bold')
-        axes[2].set_xlabel('折数', fontsize=12)
-        axes[2].set_ylabel('F1分数', fontsize=12)
-        axes[2].set_xticks(range(1, len(fold_f1s) + 1))
-        axes[2].legend()
-        axes[2].grid(True, alpha=0.3, axis='y')
+        # 2. Bar chart of fold AUC scores
+        axes[0, 1].bar(range(1, len(fold_aucs) + 1), fold_aucs, 
+                    color='lightgreen', edgecolor='black', alpha=0.8)
+        axes[0, 1].axhline(y=avg_metrics['avg_val_auc'], color='red', linestyle='--', 
+                        linewidth=2, label=f'Mean: {avg_metrics["avg_val_auc"]:.4f}')
+        axes[0, 1].set_title('AUC Score per Fold', fontsize=14, fontweight='bold')
+        axes[0, 1].set_xlabel('Fold Number', fontsize=12)
+        axes[0, 1].set_ylabel('AUC Score', fontsize=12)
+        axes[0, 1].set_xticks(range(1, len(fold_aucs) + 1))
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3, axis='y')
         
-        plt.tight_layout()
+        # Add value labels on bars
+        for i, auc in enumerate(fold_aucs):
+            axes[0, 1].text(i + 1, auc + 0.005, f'{auc:.3f}', 
+                        ha='center', va='bottom', fontsize=9)
         
-        # 保存图表
+        # 3. Bar chart of fold F1 scores
+        axes[1, 0].bar(range(1, len(fold_f1s) + 1), fold_f1s, 
+                    color='lightcoral', edgecolor='black', alpha=0.8)
+        axes[1, 0].axhline(y=avg_metrics['avg_val_f1'], color='red', linestyle='--', 
+                        linewidth=2, label=f'Mean: {avg_metrics["avg_val_f1"]:.4f}')
+        axes[1, 0].set_title('F1 Score per Fold', fontsize=14, fontweight='bold')
+        axes[1, 0].set_xlabel('Fold Number', fontsize=12)
+        axes[1, 0].set_ylabel('F1 Score', fontsize=12)
+        axes[1, 0].set_xticks(range(1, len(fold_f1s) + 1))
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3, axis='y')
+        
+        # Add value labels on bars
+        for i, f1 in enumerate(fold_f1s):
+            axes[1, 0].text(i + 1, f1 + 0.005, f'{f1:.3f}', 
+                        ha='center', va='bottom', fontsize=9)
+        
+        # 4. Performance metrics summary table
+        axes[1, 1].axis('off')
+        
+        # Create table data
+        table_data = []
+        for i in range(len(fold_results)):
+            table_data.append([
+                f'Fold {i+1}',
+                f'{fold_accs[i]:.4f}',
+                f'{fold_aucs[i]:.4f}',
+                f'{fold_f1s[i]:.4f}'
+            ])
+        
+        # Add average row
+        table_data.append([
+            'Average ± Std',
+            f'{avg_metrics["avg_val_acc"]:.4f} ± {avg_metrics["std_val_acc"]:.4f}',
+            f'{avg_metrics["avg_val_auc"]:.4f} ± {avg_metrics["std_val_auc"]:.4f}',
+            f'{avg_metrics["avg_val_f1"]:.4f} ± {avg_metrics["std_val_f1"]:.4f}'
+        ])
+        
+        # Create table
+        table = axes[1, 1].table(
+            cellText=table_data,
+            colLabels=['Fold', 'Accuracy', 'AUC', 'F1 Score'],
+            colWidths=[0.15, 0.25, 0.25, 0.25],
+            cellLoc='center',
+            loc='center',
+            fontsize=11
+        )
+        
+        # Style the table
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        table.scale(1.2, 1.5)
+        
+        # Style header row
+        for i in range(4):
+            table[(0, i)].set_facecolor('#40466e')
+            table[(0, i)].set_text_props(weight='bold', color='white')
+        
+        # Style average row
+        for i in range(4):
+            table[(len(fold_results), i)].set_facecolor('#f2f2f2')
+            table[(len(fold_results), i)].set_text_props(weight='bold')
+        
+        # Style alternating rows
+        for i in range(1, len(fold_results)):
+            for j in range(4):
+                if i % 2 == 0:
+                    table[(i, j)].set_facecolor('#f9f9f9')
+        
+        axes[1, 1].set_title('Cross-Validation Performance Summary', 
+                            fontsize=14, fontweight='bold', y=1.05)
+        
+        plt.tight_layout(rect=[0, 0, 1, 0.96])  # Adjust layout for suptitle
+        
+        # Save visualization
         vis_path = os.path.join(self.experiment_dir, "visualizations", "cv_results_comparison.png")
         plt.savefig(vis_path, dpi=150, bbox_inches='tight')
         plt.close()
         
-        print(f"📊 交叉验证结果可视化已保存: {vis_path}")
+        # Also create a performance trend visualization
+        self._create_performance_trend_visualization(fold_results)
+        
+        print(f"📊 Cross-validation visualization saved: {vis_path}")
+
+    def _create_performance_trend_visualization(self, fold_results):
+        """Create a line chart showing performance trends across folds"""
+        if not self.experiment_dir:
+            return
+        
+        # Extract metrics for trend analysis
+        fold_numbers = list(range(1, len(fold_results) + 1))
+        accuracies = [r['best_val_acc'] for r in fold_results]
+        aucs = [r['best_val_auc'] for r in fold_results]
+        f1_scores = [r['best_val_f1'] for r in fold_results]
+        
+        # Create trend visualization
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        # Plot lines with markers
+        ax.plot(fold_numbers, accuracies, 'o-', color='skyblue', linewidth=2, markersize=8, 
+                label='Accuracy', alpha=0.8)
+        ax.plot(fold_numbers, aucs, 's-', color='lightgreen', linewidth=2, markersize=8, 
+                label='AUC', alpha=0.8)
+        ax.plot(fold_numbers, f1_scores, '^-', color='lightcoral', linewidth=2, markersize=8, 
+                label='F1 Score', alpha=0.8)
+        
+        # Calculate and plot trend lines
+        if len(fold_numbers) >= 3:
+            # Linear regression for accuracy trend
+            z_acc = np.polyfit(fold_numbers, accuracies, 1)
+            p_acc = np.poly1d(z_acc)
+            ax.plot(fold_numbers, p_acc(fold_numbers), '--', color='skyblue', alpha=0.5, 
+                    label='Accuracy Trend')
+            
+            # Linear regression for AUC trend
+            z_auc = np.polyfit(fold_numbers, aucs, 1)
+            p_auc = np.poly1d(z_auc)
+            ax.plot(fold_numbers, p_auc(fold_numbers), '--', color='lightgreen', alpha=0.5, 
+                    label='AUC Trend')
+            
+            # Linear regression for F1 trend
+            z_f1 = np.polyfit(fold_numbers, f1_scores, 1)
+            p_f1 = np.poly1d(z_f1)
+            ax.plot(fold_numbers, p_f1(fold_numbers), '--', color='lightcoral', alpha=0.5, 
+                    label='F1 Trend')
+        
+        # Style the plot
+        ax.set_title('Performance Trends Across Cross-Validation Folds', 
+                    fontsize=16, fontweight='bold')
+        ax.set_xlabel('Fold Number', fontsize=12)
+        ax.set_ylabel('Score Value', fontsize=12)
+        ax.set_xticks(fold_numbers)
+        ax.set_ylim([0.5, 1.0])  # Set reasonable y-limits for classification metrics
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.legend(loc='best', fontsize=10)
+        
+        # Add value annotations
+        for i, (acc, auc, f1) in enumerate(zip(accuracies, aucs, f1_scores)):
+            ax.annotate(f'{acc:.3f}', (fold_numbers[i], acc), 
+                    textcoords="offset points", xytext=(0,5), 
+                    ha='center', fontsize=8, color='skyblue')
+            ax.annotate(f'{auc:.3f}', (fold_numbers[i], auc), 
+                    textcoords="offset points", xytext=(0,5), 
+                    ha='center', fontsize=8, color='lightgreen')
+            ax.annotate(f'{f1:.3f}', (fold_numbers[i], f1), 
+                    textcoords="offset points", xytext=(0,5), 
+                    ha='center', fontsize=8, color='lightcoral')
+        
+        # Add statistics text box
+        stats_text = f"""Statistics:
+    Mean Accuracy: {np.mean(accuracies):.4f} ± {np.std(accuracies):.4f}
+    Mean AUC: {np.mean(aucs):.4f} ± {np.std(aucs):.4f}
+    Mean F1: {np.mean(f1_scores):.4f} ± {np.std(f1_scores):.4f}
+
+    Total Folds: {len(fold_results)}
+    """
+        
+        # Place text box in upper left
+        props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
+        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=10,
+                verticalalignment='top', bbox=props)
+        
+        plt.tight_layout()
+        
+        # Save trend visualization
+        trend_path = os.path.join(self.experiment_dir, "visualizations", "cv_performance_trend.png")
+        plt.savefig(trend_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"📈 Performance trend visualization saved: {trend_path}")
 
     def _get_config_dict(self):
         """获取当前训练配置"""
@@ -1031,11 +1949,16 @@ class HyperparameterSearcher:
     
     BATCH_SIZES = [32, 64, 128]
     
-    def __init__(self, base_path, composite_weights=None):
+    def __init__(self, base_path, composite_weights=None,
+                 use_focal_loss=False, focal_alpha=None, focal_gamma=2.0, adjusted_lr=None):
         self.base_path = base_path
         self.file_manager = ModelFileManager()
         self.composite_weights = composite_weights
         self.visualizer = TrainingVisualizer()
+        self.use_focal_loss = use_focal_loss
+        self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
+        self.adjusted_lr = adjusted_lr or LEARNING_RATE
     
     def search(self, num_epochs_search=20):
         """执行超参数搜索，使用综合评分评估配置"""
@@ -1072,7 +1995,11 @@ class HyperparameterSearcher:
         total_configs = len(self.KERNEL_CONFIGS) * len(self.BATCH_SIZES)
         
         # 创建总体搜索进度条
-        config_pbar = self.visualizer.create_progress_bar(total_configs, "超参数搜索进度")
+        config_pbar = tqdm(
+            total=total_configs, 
+            desc="超参数搜索进度",
+            bar_format='{desc}: {percentage:3.0f}%|{bar:20}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+        )
         config_idx = 0
 
         # 遍历所有超参数组合
@@ -1100,12 +2027,15 @@ class HyperparameterSearcher:
                     base_path=self.base_path,
                     kernel_config=kernel_config,
                     batch_size=batch_size,
-                    lr=LEARNING_RATE,
+                    lr=self.adjusted_lr,  # 使用调整后的学习率
                     use_stream2=USE_STREAM2_SETTING,
                     augment=AUGMENT_SETTING,
                     experiment_dir=config_dir,
                     config_name=config_name,
-                    composite_weights=self.composite_weights
+                    composite_weights=self.composite_weights,
+                    use_focal_loss=self.use_focal_loss,  # 新增
+                    focal_alpha=self.focal_alpha,        # 新增
+                    focal_gamma=self.focal_gamma         # 新增
                 )
                 
                 # 在训练集上进行5折交叉验证
@@ -1321,16 +2251,26 @@ class CompleteTrainer:
     """使用最佳配置进行完整训练"""
     
     @staticmethod
-    def train_with_best_config(base_path, best_config_data):
+    def train_with_best_config(base_path, best_config_data, lr_scheduler_config=None,
+                               use_focal_loss=False, focal_alpha=None, focal_gamma=2.0, 
+                               adjusted_lr=None):
         """
         完整训练流程：
         1. 在训练集（CV0~CV3）上使用最佳超参数进行5折交叉验证
         2. 使用全部训练集训练最终模型（包含验证集和早停）
         3. 在测试集（CV4）上最终评估
+        
+        Args:
+            base_path: 数据集路径
+            best_config_data: 最佳配置数据
+            lr_scheduler_config: 学习率调度器配置
         """
         print("=" * 80)
         print("完整训练模式（使用综合评分和早停机制）")
         print("=" * 80)
+
+        if adjusted_lr is None:
+            adjusted_lr = LEARNING_RATE
         
         # 创建实验目录
         file_manager = ModelFileManager()
@@ -1345,17 +2285,25 @@ class CompleteTrainer:
         
         # 使用最佳配置中的综合评分权重（如果有）
         composite_weights = best_config_data.get('composite_weights')
+
+        # 如果未提供调度器配置，使用 Config.py 中的默认配置
+        if lr_scheduler_config is None:
+            lr_scheduler_config = LR_SCHEDULER_CONFIG
         
         trainer = ModelTrainer(
             base_path=base_path,
             kernel_config=best_config_data['kernel_config'],
             batch_size=best_config_data['batch_size'],
-            lr=LEARNING_RATE,
+            lr=adjusted_lr,  # 使用调整后的学习率
             use_stream2=USE_STREAM2_SETTING,
             augment=AUGMENT_SETTING,
             experiment_dir=experiment_dir,
             config_name="BestConfig",
-            composite_weights=composite_weights
+            composite_weights=composite_weights,
+            lr_scheduler_config=lr_scheduler_config,
+            use_focal_loss=use_focal_loss,  # 新增
+            focal_alpha=focal_alpha,        # 新增
+            focal_gamma=focal_gamma         # 新增
         )
         
         train_indices = [0, 1, 2, 3]
@@ -1392,7 +2340,8 @@ class CompleteTrainer:
             'complete_training_time': datetime.now().isoformat(),
             'early_stop_patience': EARLY_STOP_PATIENCE,
             'min_delta': MIN_DELTA,
-            'composite_weights': composite_weights
+            'composite_weights': composite_weights,
+            'lr_scheduler_config':LR_SCHEDULER_CONFIG  # 保存调度器配置
         }
         
         summary_path = os.path.join(experiment_dir, "metrics", "complete_training_summary.json")
@@ -1408,6 +2357,11 @@ class TrainingPipeline:
     def __init__(self):
         # 数据集路径
         self.base_path = "/home/xusi/EE5046_Projects/Dataset"
+        self.loss_config = get_loss_config()
+        self.use_focal_loss = USE_FOCAL_LOSS
+        self.focal_alpha = self.loss_config.get('focal_alpha')
+        self.focal_gamma = self.loss_config.get('focal_gamma')
+        self.adjusted_lr = self.loss_config.get('adjusted_lr', LEARNING_RATE)
 
         # 检查路径是否存在
         if not os.path.exists(self.base_path):
@@ -1444,13 +2398,33 @@ class TrainingPipeline:
         self.train_indices = [0, 1, 2, 3]
         self.test_indices = [4]
         
-        # 自定义综合评分权重（可根据任务调整）
+        # 调整后的综合评分权重 - 更重视F1分数
         self.custom_weights = {
-            'accuracy': 0.40,  # 提高准确率权重
-            'auc': 0.35,       # AUC权重
-            'f1': 0.20,        # F1分数权重
+            'accuracy': 0.30,  # 降低准确率权重
+            'auc': 0.30,       # AUC权重保持不变
+            'f1': 0.35,        # 提高F1分数权重
             'stability': 0.05  # 稳定性权重
         }
+
+        # 初始化训练器配置缓存 - 这是关键修复！
+        self.trainer_config = None
+        
+        # 打印初始化完成信息
+        print(f"✅ TrainingPipeline 初始化完成")
+        print(f"  训练集: CV{', '.join(map(str, self.train_indices))}")
+        print(f"  测试集: CV{', '.join(map(str, self.test_indices))}")
+
+    def _create_trainer(self, **kwargs):
+        """创建训练器的统一方法"""
+        default_kwargs = {
+            'base_path': self.base_path,
+            'use_focal_loss': self.use_focal_loss,
+            'focal_alpha': self.focal_alpha,
+            'focal_gamma': self.focal_gamma,
+            'lr': self.adjusted_lr,  # 使用调整后的学习率
+        }
+        default_kwargs.update(kwargs)
+        return ModelTrainer(**default_kwargs)
     
     def run(self):
         """运行训练管道"""
@@ -1464,6 +2438,19 @@ class TrainingPipeline:
         parser.add_argument('--weights', type=str, default='default',
                             choices=['default', 'accuracy_focus', 'balanced', 'auc_focus'],
                             help='综合评分权重策略')
+
+        parser.add_argument('--loss', type=str, default='focal',
+                        choices=['bce', 'focal'],
+                        help='损失函数类型: bce或focal')
+        parser.add_argument('--focal_alpha', type=float, default=None,
+                            help='Focal Loss的alpha参数 (0-1)。默认None时会自动计算')
+        parser.add_argument('--focal_gamma', type=float, default=2.0,
+                            help='Focal Loss的gamma参数 (默认2.0)')
+        parser.add_argument('--focal_config', type=str, default='focus_positive',
+                            choices=['default', 'balanced', 'focus_positive', 'focus_hard'],
+                            help='预设的Focal Loss配置')
+        parser.add_argument('--lr', type=float, default=LEARNING_RATE,
+                            help='初始学习率')
         
         parser.add_argument('--no_progress', action='store_true',
                             help='禁用进度条显示')
@@ -1493,19 +2480,91 @@ class TrainingPipeline:
             print(f"综合评分权重: {weights}")
         
         if args.mode == 'search':
-            self._run_search_mode(weights)
+            self._run_search_mode(args,weights)
         elif args.mode == 'train':
-            self._run_train_mode(weights)
+            self._run_train_mode(args,weights)
         elif args.mode == 'full':
+            self._run_data_diagnostic()
             self._run_full_mode(args, weights)
         elif args.mode == 'compare':
             self._run_compare_mode(args, weights)
+
+    def _setup_focal_loss_config(self, args):
+        """设置Focal Loss配置 - 统一版本"""
+        # 使用Config.py中的默认配置
+        default_config = LOSS_FUNCTION_CONFIG.copy()
+        
+        # 如果有预设配置名称，使用预设配置
+        if args.focal_config in FOCAL_PRESET_CONFIGS:
+            preset = FOCAL_PRESET_CONFIGS[args.focal_config]
+            
+            # 用命令行参数覆盖预设配置
+            focal_alpha = args.focal_alpha or preset.get('alpha', default_config.get('focal_alpha', 0.25))
+            focal_gamma = args.focal_gamma or preset.get('gamma', default_config.get('focal_gamma', 2.0))
+            lr_factor = preset.get('lr_factor', 0.5)
+            
+            config_source = f"预设配置: {args.focal_config}"
+        else:
+            # 使用命令行参数或Config.py中的默认值
+            focal_alpha = args.focal_alpha or default_config.get('focal_alpha', 0.25)
+            focal_gamma = args.focal_gamma or default_config.get('focal_gamma', 2.0)
+            lr_factor = default_config.get('lr_factor', 0.5)
+            
+            config_source = f"命令行参数 + Config.py默认值"
+        
+        # 计算调整后的学习率
+        adjusted_lr = args.lr * lr_factor
+        
+        print(f"\n🎯 Focal Loss配置 ({config_source}):")
+        print(f"  Alpha: {focal_alpha}")
+        print(f"  Gamma: {focal_gamma}")
+        print(f"  学习率调整因子: {lr_factor}")
+        print(f"  调整后学习率: {adjusted_lr:.6f}")
+        
+        return focal_alpha, focal_gamma, adjusted_lr
     
-    def _run_search_mode(self, weights):
+    def _get_trainer_config(self, args):
+        """获取统一的训练器配置"""
+        if self.trainer_config is None:
+            # 计算Focal Loss参数
+            if args.loss == 'focal':
+                focal_alpha, focal_gamma, adjusted_lr = self._setup_focal_loss_config(args)
+                use_focal_loss = True
+            else:
+                focal_alpha, focal_gamma, adjusted_lr = None, None, args.lr
+                use_focal_loss = False
+            
+            # 缓存配置
+            self.trainer_config = {
+                'use_focal_loss': use_focal_loss,
+                'focal_alpha': focal_alpha,
+                'focal_gamma': focal_gamma,
+                'adjusted_lr': adjusted_lr
+            }
+            
+            print(f"\n🎯 统一训练器配置:")
+            print(f"  使用Focal Loss: {self.trainer_config['use_focal_loss']}")
+            if self.trainer_config['use_focal_loss']:
+                print(f"  Focal Alpha: {self.trainer_config['focal_alpha']}")
+                print(f"  Focal Gamma: {self.trainer_config['focal_gamma']}")
+            print(f"  学习率: {self.trainer_config['adjusted_lr']:.6f}")
+        
+        return self.trainer_config
+    
+    def _run_search_mode(self,args,weights):
         """运行超参数搜索模式"""
         print("\n模式: 超参数搜索（使用综合评分）")
+        # 获取统一的训练器配置
+        trainer_config = self._get_trainer_config(args)
         
-        searcher = HyperparameterSearcher(self.base_path, composite_weights=weights)
+        searcher = HyperparameterSearcher(
+            self.base_path, 
+            composite_weights=weights,
+            use_focal_loss=trainer_config['use_focal_loss'],
+            focal_alpha=trainer_config['focal_alpha'],
+            focal_gamma=trainer_config['focal_gamma'],
+            adjusted_lr=trainer_config['adjusted_lr']
+        )
         best_config, search_dir = searcher.search(num_epochs_search=30)
         
         print(f"\n超参数搜索完成!")
@@ -1513,9 +2572,11 @@ class TrainingPipeline:
         print(f"综合评分: {best_config['avg_composite_score']:.4f}")
         print(f"结果目录: {search_dir}")
     
-    def _run_train_mode(self, weights):
+    def _run_train_mode(self,args,weights):
         """运行默认训练模式"""
         print("\n模式: 默认配置训练（使用综合评分和早停）")
+        # 获取统一的训练器配置
+        trainer_config = self._get_trainer_config(args)
         
         # 创建实验目录
         file_manager = ModelFileManager()
@@ -1529,13 +2590,16 @@ class TrainingPipeline:
             base_path=self.base_path,
             kernel_config=DEFAULT_KERNEL_CONFIG,
             batch_size=BATCH_SIZE,
-            lr=LEARNING_RATE,
+            lr=trainer_config['adjusted_lr'],  # 使用统一的学习率
             use_stream2=USE_STREAM2_SETTING,
             augment=AUGMENT_SETTING,
             experiment_dir=experiment_dir,
             config_name="DefaultConfig",
-            composite_weights=weights
-        )
+            composite_weights=weights,
+            use_focal_loss=trainer_config['use_focal_loss'],
+            focal_alpha=trainer_config['focal_alpha'],
+            focal_gamma=trainer_config['focal_gamma']
+    )
         
         # 在训练集上进行5折交叉验证
         cv_metrics, cv_results = trainer.cross_validate_on_train_set(
@@ -1545,6 +2609,34 @@ class TrainingPipeline:
         print(f"\n默认训练完成!")
         print(f"平均综合评分: {cv_metrics.get('avg_composite_score', 0):.4f}")
         print(f"结果目录: {experiment_dir}")
+
+    def _run_data_diagnostic(self):
+        """运行数据诊断"""
+        print("\n=== 数据诊断模式 ===")
+        
+        # 创建临时训练器
+        trainer = ModelTrainer(
+            base_path=self.base_path,
+            kernel_config=DEFAULT_KERNEL_CONFIG,
+            batch_size=32,
+            lr=0.001,
+            use_stream2=True,
+            augment=True,
+            experiment_dir=None,
+            config_name="Diagnostic"
+        )
+        
+        # 运行基本功能测试
+        trainer.test_basic_functionality()
+        
+        # 检查数据分布
+        print("\n=== 检查CV文件分布 ===")
+        for cv_idx in range(5):
+            data = trainer.data_manager.load_cv_files([cv_idx])
+            if len(data) > 0:
+                labels = [label for _, label in data[:1000]]  # 只检查前1000个
+                labels_np = np.array(labels)
+                print(f"CV{cv_idx}: 样本数={len(data)}, 正样本比例={np.mean(labels_np):.2%}")
     
     def _run_full_mode(self, args, weights):
         """运行完整训练模式"""
@@ -1558,11 +2650,20 @@ class TrainingPipeline:
             
             print(f"加载最佳配置: {best_config_data['best_config_name']}")
             print(f"选择标准: {best_config_data.get('selection_criteria', 'accuracy')}")
+
+            # 获取统一的训练器配置
+            trainer_config = self._get_trainer_config(args)
             
-            # 使用最佳配置进行完整训练
+            # 使用最佳配置进行完整训练，并传递学习率调度器配置
             cv_metrics, test_results, experiment_dir = CompleteTrainer.train_with_best_config(
-                self.base_path, best_config_data['best_config_data']
-            )
+                self.base_path, 
+                best_config_data['best_config_data'],
+                lr_scheduler_config=LR_SCHEDULER_CONFIG,
+                use_focal_loss=trainer_config['use_focal_loss'],
+                focal_alpha=trainer_config['focal_alpha'],
+                focal_gamma=trainer_config['focal_gamma'],
+                adjusted_lr=trainer_config['adjusted_lr']
+        )
             
             print(f"\n完整训练完成!")
             print(f"交叉验证平均综合评分: {cv_metrics.get('avg_composite_score', 0):.4f}")
@@ -1571,7 +2672,7 @@ class TrainingPipeline:
         else:
             print(f"错误: 找不到最佳配置文件 {best_config_path}")
             print("请先运行超参数搜索模式: python TrainProcess.py --mode search")
-    
+
     def _run_compare_mode(self, args, weights):
         """运行对比实验模式"""
         print("\n模式: 对比实验")

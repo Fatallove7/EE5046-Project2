@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM
 from peft import LoraConfig, TaskType, get_peft_model
-from ECGEncoder import ECGEncoder
+from EE5046_Projects.src.task2_multimodal_llm.models.ECGEncoder import ECGEncoder
 
 class MultimodalLLM(nn.Module):
     def __init__(self, llm_path, cnn_config, cnn_weights_path, ecg_token_id, flat_dim, llm_embed_dim, device=None):

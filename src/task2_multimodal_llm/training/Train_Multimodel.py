@@ -17,7 +17,7 @@ from torch.amp import GradScaler, autocast
 # 导入自定义模块
 from MultimodelLLM import MultimodalLLM
 from MultimodelDataset import MultimodalDataset
-from ECGEncoder import ECGEncoder
+from EE5046_Projects.src.task2_multimodal_llm.models.ECGEncoder import ECGEncoder
 from Config import CNN_WEIGHTS_PATH, DATASET_PATH, FIXED_LENGTH, JSON_PATH
 
 

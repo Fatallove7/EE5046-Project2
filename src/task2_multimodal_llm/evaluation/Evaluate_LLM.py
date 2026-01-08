@@ -16,7 +16,7 @@ import re
 
 # 导入自定义模块（根据您的实际路径调整）
 from MultimodelLLM import MultimodalLLM
-from ECGEncoder import ECGEncoder
+from EE5046_Projects.src.task2_multimodal_llm.models.ECGEncoder import ECGEncoder
 from Config import CNN_WEIGHTS_PATH, DATASET_PATH, FIXED_LENGTH
 
 # 修改后的标签映射字典

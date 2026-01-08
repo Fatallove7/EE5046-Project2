@@ -28,6 +28,33 @@ DATASET_PATH = "/home/xusi/EE5046_Projects/Dataset"
 JSON_PATH = "/home/xusi/EE5046_Projects/Dataset/MMID/multimodal_instruction_data.json"
 
 
+# 学习率调度器配置
+LR_SCHEDULER_CONFIG = {
+    'use_scheduler': True,           # 是否使用学习率调度器
+    'scheduler_type': 'plateau',     # 'plateau', 'cosine', 'onecycle', 'step'
+    'plateau_config': {
+        'mode': 'max',               # 监控指标方向：max/min
+        'factor': 0.5,               # 学习率衰减因子
+        'patience': 5,               # 容忍epoch数
+        'min_lr': 1e-6,              # 最小学习率
+        'verbose': True              # 是否打印调整信息
+    },
+    'cosine_config': {
+        'T_max': NUM_EPOCHS,         # 半周期长度
+        'eta_min': 1e-6              # 最小学习率
+    },
+    'onecycle_config': {
+        'max_lr': LEARNING_RATE,     # 最大学习率
+        'pct_start': 0.3,            # 上升阶段占比
+        'div_factor': 25.0,          # 初始学习率 = max_lr/div_factor
+        'final_div_factor': 1e4      # 最终学习率 = initial_lr/final_div_factor
+    },
+    'step_config': {
+        'step_size': 10,             # 多少epoch衰减一次
+        'gamma': 0.5                 # 衰减因子
+    }
+}
+
 # ==================== 对比实验配置 ====================
 COMPARISON_EXPERIMENT = False  # 是否进行对比实验
 COMPARISON_MODE = 'augment'    # 'stream'对比stream配置, 'augment'对比数据增强
@@ -74,3 +101,37 @@ DEFAULT_KERNEL_CONFIG = {
     'stream1_kernel': 3, 
     'stream2_first_kernel': 7
 }
+
+LOSS_FUNCTION_CONFIG = {
+    'type': 'focal',  # 'bce' 或 'focal'
+    'focal_alpha': 0.25,  # Focal Loss的alpha参数，None则自动计算
+    'focal_gamma': 2.0,   # Focal Loss的gamma参数
+    'focal_config': 'focus_positive',  # 预设配置: 'default', 'balanced', 'focus_positive', 'focus_hard'
+}
+
+# Focal Loss预设配置
+FOCAL_PRESET_CONFIGS = {
+    'default': {'alpha': 0.25, 'gamma': 2.0, 'lr_factor': 0.5},
+    'balanced': {'alpha': 0.5, 'gamma': 2.0, 'lr_factor': 0.5},
+    'focus_positive': {'alpha': 0.85, 'gamma': 3.0, 'lr_factor': 0.1},
+    'focus_hard': {'alpha': 0.25, 'gamma': 3.0, 'lr_factor': 0.3},
+}
+
+# 是否启用Focal Loss（兼容旧配置）
+USE_FOCAL_LOSS = (LOSS_FUNCTION_CONFIG['type'] == 'focal')
+
+def get_loss_config(focal_config_name=None):
+    """获取损失函数配置"""
+    config = LOSS_FUNCTION_CONFIG.copy()
+    
+    if focal_config_name and focal_config_name in FOCAL_PRESET_CONFIGS:
+        preset = FOCAL_PRESET_CONFIGS[focal_config_name]
+        config.update(preset)
+    
+    # 计算调整后的学习率
+    if config['type'] == 'focal':
+        config['adjusted_lr'] = LEARNING_RATE * config.get('lr_factor', 0.5)
+    else:
+        config['adjusted_lr'] = LEARNING_RATE
+        
+    return config
