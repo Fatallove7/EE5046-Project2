@@ -7,7 +7,7 @@ import numpy as np
 from scipy.interpolate import interp1d
 from transformers import AutoTokenizer
 # 假设 Config.py 中的常量可以被导入
-from Config import FIXED_LENGTH, DOWNSAMPLE_RATE, AUGMENT_SETTING
+from src.common.Config import FIXED_LENGTH, DOWNSAMPLE_RATE, AUGMENT_SETTING
 
 
 # ------------------------------------------------------------------

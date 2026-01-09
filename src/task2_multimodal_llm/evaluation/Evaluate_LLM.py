@@ -15,9 +15,9 @@ from pathlib import Path
 import re
 
 # 导入自定义模块（根据您的实际路径调整）
-from MultimodelLLM import MultimodalLLM
+from src.task2_multimodal_llm.models.MultimodelLLM import MultimodalLLM
 from EE5046_Projects.src.task2_multimodal_llm.models.ECGEncoder import ECGEncoder
-from Config import CNN_WEIGHTS_PATH, DATASET_PATH, FIXED_LENGTH
+from src.common.Config import CNN_WEIGHTS_PATH, DATASET_PATH, FIXED_LENGTH
 
 # 修改后的标签映射字典
 # 根据CSV文件格式：A表示房颤，其他(0, N, O, ~等)表示非房颤

@@ -1,7 +1,7 @@
 # ECGEncoder.py
 import torch
 import torch.nn as nn
-from TrainModel import Mscnn  # 导入任务 1 的 CNN 定义
+from src.task1_ecg_analysis.training.TrainModel import Mscnn  # 导入任务 1 的 CNN 定义
 
 class ECGEncoder(Mscnn):
     """

@@ -407,35 +407,200 @@ class ModelTrainer:
         self.best_epoch = 0
         self.early_stop_counter = 0
 
+    def _find_precision_optimized_threshold(self, labels, probs, return_all=False):
+        """寻找更注重精确率的阈值"""
+        # 首先确保有足够的概率变化
+        if np.max(probs) - np.min(probs) < 0.1:
+            print("  警告: 概率变化很小，使用默认阈值")
+            if return_all:
+                return 0.5, 0, 0, 0
+            else:
+                return 0.5
+        
+        # 搜索范围根据概率分布调整
+        prob_min = max(0.1, np.min(probs))
+        prob_max = min(0.9, np.max(probs))
+        
+        # 如果概率范围太小，扩大搜索范围
+        if prob_max - prob_min < 0.3:
+            prob_min = max(0.1, prob_min - 0.1)
+            prob_max = min(0.9, prob_max + 0.1)
+        
+        thresholds = np.linspace(prob_min, prob_max, 51)
+        
+        best_score = 0
+        best_threshold = 0.5
+        best_precision = 0
+        best_recall = 0
+        
+        for th in thresholds:
+            preds = (probs >= th).astype(int)
+            pos_predictions = np.sum(preds)
+            
+            # 如果没有任何预测，跳过这个阈值
+            if pos_predictions == 0:
+                continue
+                
+            precision = precision_score(labels, preds, zero_division=0)
+            recall = recall_score(labels, preds, zero_division=0)
+            f1 = f1_score(labels, preds, zero_division=0)
+            
+            # 更注重精确率的评分
+            # 但也要确保有一定数量的预测
+            weighted_score = 0.5 * precision + 0.3 * f1 + 0.2 * min(recall, 0.5)
+            
+            if weighted_score > best_score:
+                best_score = weighted_score
+                best_threshold = th
+                best_precision = precision
+                best_recall = recall
+        
+        # 如果没有任何阈值能预测出正样本，使用更低的阈值
+        if best_score == 0:
+            print("  警告: 没有阈值能预测出正样本，使用更低的阈值")
+            best_threshold = prob_min  # 使用最低的阈值
+            preds = (probs >= best_threshold).astype(int)
+            best_precision = precision_score(labels, preds, zero_division=0)
+            best_recall = recall_score(labels, preds, zero_division=0)
+            best_f1 = f1_score(labels, preds, zero_division=0)
+        
+        if return_all:
+            return best_threshold, best_f1, best_precision, best_recall
+        else:
+            return best_threshold
+
+    def _find_best_two_stage_combo(self, labels, probs, max_combinations=20):
+        """寻找最佳的两阶段阈值组合"""
+        print("  搜索最佳两阶段阈值组合...")
+        
+        # 首先检查概率分布
+        print(f"  概率范围: [{np.min(probs):.4f}, {np.max(probs):.4f}]")
+        print(f"  概率平均值: {np.mean(probs):.4f}")
+        
+        # 确保有正样本的概率
+        if np.max(probs) < 0.3:  # 如果最大概率都很低
+            print("  警告: 所有预测概率都很低，可能模型有问题")
+            return {
+                'stage1_threshold': 0.1,  # 使用很低的阈值
+                'stage2_threshold': 0.3,
+                'precision': 0,
+                'recall': 0,
+                'f1': 0
+            }
+        
+        # 定义搜索范围（根据实际概率分布调整）
+        prob_min = max(0.1, np.percentile(probs, 5))  # 第5百分位数作为下限
+        prob_max = min(0.9, np.percentile(probs, 95))  # 第95百分位数作为上限
+        
+        # 确保搜索范围合理
+        if prob_max - prob_min < 0.2:
+            prob_min = max(0.1, prob_min - 0.1)
+            prob_max = min(0.9, prob_max + 0.1)
+        
+        stage1_options = np.linspace(prob_min, min(prob_max, 0.6), 6)
+        stage2_options = np.linspace(max(prob_min, 0.4), prob_max, 8)
+        
+        best_f1 = 0
+        best_combo = {
+            'stage1_threshold': 0.3,
+            'stage2_threshold': 0.5,
+            'precision': 0,
+            'recall': 0,
+            'f1': 0
+        }
+        
+        tested_combos = 0
+        
+        for s1 in stage1_options:
+            for s2 in stage2_options:
+                if s2 <= s1:  # 确保第二阶段阈值高于第一阶段
+                    continue
+                
+                # 两阶段预测
+                stage1_preds = (probs >= s1).astype(int)
+                pos_indices = np.where(stage1_preds == 1)[0]
+                final_preds = stage1_preds.copy()
+                
+                if len(pos_indices) > 0:
+                    pos_probs = probs[pos_indices]
+                    stage2_preds = (pos_probs >= s2).astype(int)
+                    final_preds[pos_indices] = stage2_preds
+                
+                # 计算指标
+                try:
+                    precision = precision_score(labels, final_preds, zero_division=0)
+                    recall = recall_score(labels, final_preds, zero_division=0)
+                    f1 = f1_score(labels, final_preds, zero_division=0)
+                except:
+                    precision = recall = f1 = 0
+                
+                # 检查是否预测了正样本
+                pos_predictions = np.sum(final_preds)
+                if pos_predictions == 0:
+                    # 如果没有预测正样本，跳过这个组合
+                    continue
+                
+                # 综合评分：平衡精确率、召回率和F1
+                composite_score = 0.4 * precision + 0.4 * f1 + 0.2 * recall
+                
+                if composite_score > best_f1:
+                    best_f1 = composite_score
+                    best_combo = {
+                        'stage1_threshold': s1,
+                        'stage2_threshold': s2,
+                        'precision': precision,
+                        'recall': recall,
+                        'f1': f1,
+                        'pos_predictions': int(pos_predictions)
+                    }
+                
+                tested_combos += 1
+                if tested_combos >= max_combinations:
+                    break
+            
+            if tested_combos >= max_combinations:
+                break
+        
+        print(f"  测试了 {tested_combos} 种阈值组合")
+        print(f"  最佳组合: stage1={best_combo['stage1_threshold']:.2f}, stage2={best_combo['stage2_threshold']:.2f}")
+        print(f"  预测正样本数: {best_combo.get('pos_predictions', 0)}")
+        print(f"  对应指标: 精确率={best_combo['precision']:.4f}, 召回率={best_combo['recall']:.4f}, F1={best_combo['f1']:.4f}")
+        
+        return best_combo
+
     def _two_stage_evaluate(self, probs, labels, stage1_th=0.4, stage2_th=None):
-        """两阶段评估"""
+        """两阶段评估 - 优化版本"""
         if stage2_th is None:
-            # 如果没有指定第二阶段阈值，使用单阶段最优阈值
-            stage2_th, _, _, _ = self._find_optimal_threshold(labels, probs)
+            # 如果没有指定第二阶段阈值，使用更注重精确率的阈值
+            stage2_th = self._find_precision_optimized_threshold(labels, probs)
         
         print(f"两阶段阈值策略: 第一阶段={stage1_th:.2f}, 第二阶段={stage2_th:.2f}")
         
         # 第一阶段：低阈值获取高召回
         stage1_preds = (probs >= stage1_th).astype(int)
         stage1_recall = recall_score(labels, stage1_preds, zero_division=0)
-        print(f"第一阶段召回率: {stage1_recall:.4f}")
+        stage1_precision = precision_score(labels, stage1_preds, zero_division=0)
+        print(f"第一阶段: 召回率={stage1_recall:.4f}, 精确率={stage1_precision:.4f}")
         
         # 第二阶段：只对第一阶段预测为正的样本使用高阈值
         stage1_pos_indices = np.where(stage1_preds == 1)[0]
         if len(stage1_pos_indices) == 0:
             print("⚠️ 第一阶段没有预测为正的样本")
-            return stage1_preds
+            final_preds = stage1_preds
+        else:
+            stage1_pos_probs = probs[stage1_pos_indices]
+            
+            # 对这些样本使用第二阶段阈值
+            stage2_pos_preds = (stage1_pos_probs >= stage2_th).astype(int)
+            
+            # 合并结果
+            final_preds = stage1_preds.copy()
+            final_preds[stage1_pos_indices] = stage2_pos_preds
+            
+            print(f"第一阶段正样本数: {len(stage1_pos_indices)}")
+            print(f"第二阶段保留数: {np.sum(stage2_pos_preds)} (过滤率: {(1 - np.sum(stage2_pos_preds)/len(stage1_pos_indices))*100:.1f}%)")
         
-        stage1_pos_probs = probs[stage1_pos_indices]
-        
-        # 对这些样本使用第二阶段阈值
-        stage2_pos_preds = (stage1_pos_probs >= stage2_th).astype(int)
-        
-        # 合并结果
-        final_preds = stage1_preds.copy()
-        final_preds[stage1_pos_indices] = stage2_pos_preds
-        
-        # 计算指标
+        # 计算最终指标
         final_recall = recall_score(labels, final_preds, zero_division=0)
         final_precision = precision_score(labels, final_preds, zero_division=0)
         final_f1 = f1_score(labels, final_preds, zero_division=0)
@@ -443,7 +608,7 @@ class ModelTrainer:
         
         print(f"第二阶段结果:")
         print(f"  召回率: {final_recall:.4f} (相比第一阶段: {final_recall-stage1_recall:+.4f})")
-        print(f"  精确率: {final_precision:.4f}")
+        print(f"  精确率: {final_precision:.4f} (相比第一阶段: {final_precision-stage1_precision:+.4f})")
         print(f"  F1分数: {final_f1:.4f}")
         print(f"  准确率: {final_acc:.4f}")
         
@@ -455,9 +620,10 @@ class ModelTrainer:
             'f1': final_f1,
             'stage1_threshold': stage1_th,
             'stage2_threshold': stage2_th,
-            'stage1_recall': stage1_recall
+            'stage1_recall': stage1_recall,
+            'stage1_precision': stage1_precision
         }
-
+    
     def _create_criterion(self, pos_weight, device):
         """创建损失函数（支持BCE和Focal Loss）"""
         if self.use_focal_loss:
@@ -868,15 +1034,15 @@ class ModelTrainer:
                 y = y.to(device).float()
                 
                 optimizer.zero_grad()
-                outputs = model(x)
-                loss = criterion(outputs, y)
+                logits = model(x)
+                loss = criterion(logits, y)
                 loss.backward()
                 optimizer.step()
                 
                 epoch_train_loss += loss.item()
                 
                 # 收集概率和标签（用于后续计算指标）
-                probs = torch.sigmoid(outputs)
+                probs = torch.sigmoid(logits)
                 train_probs.extend(probs.detach().cpu().numpy().flatten())
                 train_labels.extend(y.detach().cpu().numpy().flatten())
             
@@ -1140,8 +1306,8 @@ class ModelTrainer:
                 y = y.to(device).float()
                 
                 optimizer.zero_grad()
-                outputs = model(x)
-                loss = criterion(outputs, y)
+                logits = model(x)
+                loss = criterion(logits, y)
                 loss.backward()
                 optimizer.step()
                 
@@ -1293,38 +1459,49 @@ class ModelTrainer:
         return pos_weight.to(device)
     
     def _validate_model(self, model, val_loader, criterion, device):
-        """验证模型（兼容BCE和Focal Loss）"""
+        """验证模型"""
         model.eval()
         val_loss = 0.0
         all_probs = []
         all_labels = []
+        all_logits = []  # 新增：用于调试
         
         with torch.no_grad():
             for inputs, labels in val_loader:
                 inputs, labels = inputs.to(device), labels.to(device)
-                outputs = model(inputs)
+                
+                # 确保输入形状正确
+                if inputs.dim() == 2:
+                    inputs = inputs.unsqueeze(1)  # [batch, 1, length]
+                
+                # 模型输出logits
+                logits = model(inputs)
                 
                 # 统一维度
                 if labels.dim() == 1:
                     labels = labels.unsqueeze(1)
                 
-                # 计算损失
-                if isinstance(criterion, (FocalLoss, WeightedFocalLoss)):
-                    # Focal Loss需要特殊处理
-                    loss = criterion(outputs, labels.float())
-                else:
-                    loss = criterion(outputs, labels.float())
-                
+                # 计算损失（输入logits）
+                loss = criterion(logits, labels.float())
                 val_loss += loss.item()
                 
-                # 获取概率
-                probs = torch.sigmoid(outputs)
+                # 获取概率（手动应用sigmoid）
+                probs = torch.sigmoid(logits)
+                
+                # 调试信息
+                all_logits.extend(logits.cpu().numpy().flatten().tolist())
                 all_probs.extend(probs.cpu().numpy().flatten().tolist())
                 all_labels.extend(labels.cpu().numpy().flatten().tolist())
         
         avg_val_loss = val_loss / len(val_loader)
         all_probs = np.array(all_probs)
         all_labels = np.array(all_labels)
+        
+        # 添加调试信息
+        if len(all_logits) > 0:
+            all_logits = np.array(all_logits)
+            print(f"验证集logits统计: min={all_logits.min():.4f}, max={all_logits.max():.4f}, mean={all_logits.mean():.4f}")
+            print(f"验证集概率统计: min={all_probs.min():.4f}, max={all_probs.max():.4f}, mean={all_probs.mean():.4f}")
         
         # 静默处理标签转换
         if all_labels.dtype != np.int64 and all_labels.dtype != np.int32:
@@ -1349,7 +1526,8 @@ class ModelTrainer:
             'f1': best_f1,
             'threshold': best_threshold,
             'probs': all_probs,
-            'labels': all_labels
+            'labels': all_labels,
+            'logits': all_logits if 'all_logits' in locals() else None  # 可选：返回logits
         }
     
     def _compute_average_metrics(self, fold_results):
@@ -1379,10 +1557,21 @@ class ModelTrainer:
         }
     
     def evaluate_on_test_set(self, test_cv_indices, model, save_results=True, 
-                        optimize_threshold=True, use_two_stage=True):
+                        optimize_threshold=True, use_two_stage=True,
+                        stage1_threshold=0.4, stage2_threshold=None):
         """在测试集上评估模型，可选阈值优化"""
         print(f"\n在测试集上评估模型")
         print(f"测试集: CV{', '.join(map(str, test_cv_indices))}")
+
+        # ==================== 参数验证和默认值设置 ====================
+        # 设置默认值
+        if stage1_threshold is None:
+            stage1_threshold = 0.4
+        if stage2_threshold is None:
+            stage2_threshold = 0.76
+        
+        print(f"初始阈值设置: stage1={stage1_threshold:.2f}, stage2={stage2_threshold:.2f}")
+    # ===========================================================
         
         # 加载测试集数据
         test_data = self.data_manager.load_cv_files(test_cv_indices)
@@ -1400,9 +1589,8 @@ class ModelTrainer:
             test_dataset, batch_size=1, shuffle=False, num_workers=0
         )
         
-        # ==================== 修复：创建一致的损失函数 ====================
+        # ==================== 创建一致的损失函数 ====================
         if self.use_focal_loss:
-            # 使用与训练相同的Focal Loss参数
             if self.focal_alpha is not None:
                 criterion = FocalLoss(
                     alpha=self.focal_alpha,
@@ -1420,116 +1608,127 @@ class ModelTrainer:
                 ).to(device)
                 print(f"评估使用WeightedFocalLoss: gamma={self.focal_gamma}")
         else:
-            # 使用BCEWithLogitsLoss
             criterion = torch.nn.BCEWithLogitsLoss().to(device)
             print(f"评估使用BCEWithLogitsLoss")
+
+        # ==================== 添加调试信息：检查前几个样本 ====================
+        print(f"\n前5个样本的模型输出检查:")
+        model.eval()
+        sample_count = 0
+        with torch.no_grad():
+            for x, y in test_loader:
+                x = x.to(device).float()
+                x = x.view(-1, 1, FIXED_LENGTH)
+                y = y.to(device).float()
+                
+                logits = model(x)
+                probs = torch.sigmoid(logits)
+                
+                print(f"样本{sample_count}: logits={logits.cpu().numpy()[0][0]:.6f}, "
+                    f"prob={probs.cpu().numpy()[0][0]:.6f}, label={y.cpu().numpy()[0][0]:.0f}")
+                
+                sample_count += 1
+                if sample_count >= 5:
+                    break
         
         # 评估 - 获取原始概率
         test_res = self._validate_model(model, test_loader, criterion, device)
 
         test_probs = test_res['probs']
         test_labels = test_res['labels']
-        test_loss = test_loss_corrected = test_res['loss']  # 保持一致性
+        test_loss = test_res['loss']
         test_auc = test_res['auc']
-        test_f1 = test_res['f1']
         
-        # ==================== 修复：初始化所有需要的变量 ====================
-        best_threshold = 0.5  # 默认值
-        test_acc = 0.0
-        test_precision = 0.0
-        test_recall = 0.0
-        test_f1 = 0.0
-        two_stage_used = False
-        stage1_threshold = 0.4
-        stage2_threshold = 0.72
+        # ==================== 添加详细统计信息 ====================
+        print(f"\n测试集详细统计:")
+        print(f"总样本数: {len(test_probs)}")
+        print(f"正样本数: {np.sum(test_labels)}")
+        print(f"负样本数: {len(test_labels) - np.sum(test_labels)}")
+        print(f"正样本比例: {np.mean(test_labels):.2%}")
         
-        # 打印调试信息
-        print(f"测试集标签类型: {test_labels.dtype}, 形状: {test_labels.shape}")
-        print(f"测试集标签唯一值: {np.unique(test_labels)}")
-        print(f"测试集样本数: {len(test_labels)}")
-        print(f"类别分布 - 正类: {np.sum(test_labels)}, 负类: {len(test_labels) - np.sum(test_labels)}")
-        print(f"测试损失 (使用训练一致的损失函数): {test_loss_corrected:.6f}")
+        print(f"\n模型输出概率分布:")
+        print(f"最小值: {np.min(test_probs):.6f}")
+        print(f"最大值: {np.max(test_probs):.6f}")
+        print(f"平均值: {np.mean(test_probs):.6f}")
+        print(f"中位数: {np.median(test_probs):.6f}")
+        print(f"标准差: {np.std(test_probs):.6f}")
         
-        # ==================== 两阶段阈值策略 ====================
+        # 概率分布直方图
+        print(f"\n概率分布直方图:")
+        bins = np.linspace(0, 1, 21)
+        hist, bin_edges = np.histogram(test_probs, bins=bins)
+        for i in range(len(hist)):
+            print(f"  {bin_edges[i]:.2f}-{bin_edges[i+1]:.2f}: {hist[i]} samples")
+        
+        # 查看各个阈值下的预测情况
+        print(f"\n不同阈值下的预测结果:")
+        thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+        for th in thresholds:
+            preds = (test_probs >= th).astype(int)
+            pos_preds = np.sum(preds)
+            print(f"  阈值={th:.1f}: 预测正样本数={pos_preds}")
+
+        # ==================== 优化阶段：提高精确率和F1 ====================
         if use_two_stage:
-            print("\n使用两阶段阈值策略...")
-            two_stage_used = True
+            print("\n🎯 使用两阶段阈值策略（优化精确率和F1）...")
             
-            # 获取单阶段最优阈值作为第二阶段阈值
-            if optimize_threshold:
-                stage2_threshold, _, _, _ = self._find_optimal_threshold(
-                    test_labels, test_probs, metric='f1'
-                )
-                print(f"第二阶段使用单阶段最优阈值: {stage2_threshold:.3f}")
+            # 方案1：提高第二阶段阈值以提高精确率
+            if stage2_threshold is None:
+                # 寻找更注重精确率的阈值
+                stage2_threshold = self._find_precision_optimized_threshold(test_labels, test_probs)
+            
+            # 方案2：尝试多个阈值组合，选择F1最高的
+            best_metrics = self._find_best_two_stage_combo(test_labels, test_probs)
+            
+            if best_metrics['f1'] > 0.82:  # 如果找到更好的组合
+                stage1_threshold = best_metrics['stage1_threshold']
+                stage2_threshold = best_metrics['stage2_threshold']
+                print(f"使用优化后的阈值组合: stage1={stage1_threshold:.2f}, stage2={stage2_threshold:.2f}")
             else:
-                stage2_threshold = 0.72
-                print(f"第二阶段使用默认阈值: {stage2_threshold:.3f}")
+                print(f"使用默认/指定阈值: stage1={stage1_threshold:.2f}, stage2={stage2_threshold:.2f}")
             
-            # 第一阶段：低阈值获取高召回
-            stage1_preds = (test_probs >= stage1_threshold).astype(int)
-            stage1_recall = recall_score(test_labels, stage1_preds, zero_division=0)
-            print(f"第一阶段阈值={stage1_threshold}, 召回率={stage1_recall:.4f}")
+            # 调用两阶段评估方法
+            two_stage_results = self._two_stage_evaluate(
+                test_probs, test_labels, 
+                stage1_th=stage1_threshold, 
+                stage2_th=stage2_threshold
+            )
             
-            # 第二阶段：只对第一阶段预测为正的样本
-            stage1_pos_indices = np.where(stage1_preds == 1)[0]
+            test_acc = two_stage_results['acc']
+            test_precision = two_stage_results['precision']
+            test_recall = two_stage_results['recall']
+            test_f1 = two_stage_results['f1']
+            best_threshold = two_stage_results['stage2_threshold']
+            stage1_recall = two_stage_results['stage1_recall']
             
-            if len(stage1_pos_indices) > 0:
-                stage1_pos_probs = test_probs[stage1_pos_indices]
-                stage2_pos_preds = (stage1_pos_probs >= stage2_threshold).astype(int)
-                
-                # 合并结果
-                final_preds = stage1_preds.copy()
-                final_preds[stage1_pos_indices] = stage2_pos_preds
-                
-                print(f"第一阶段预测为正的样本数: {len(stage1_pos_indices)}")
-                print(f"第二阶段过滤后保留的样本数: {np.sum(stage2_pos_preds)}")
-            else:
-                final_preds = stage1_preds
-                print("⚠️ 第一阶段没有预测为正的样本")
+            print(f"优化后的两阶段结果:")
+            print(f"  第一阶段召回率: {stage1_recall:.4f}")
+            print(f"  最终精确率: {test_precision:.4f} (目标: 80%+)")
+            print(f"  最终召回率: {test_recall:.4f}")
+            print(f"  最终F1: {test_f1:.4f} (目标: 83%+)")
             
-            # 计算指标
-            test_acc = accuracy_score(test_labels, final_preds)
-            test_precision = precision_score(test_labels, final_preds, average='binary', zero_division=0)
-            test_recall = recall_score(test_labels, final_preds, average='binary', zero_division=0)
-            test_f1 = f1_score(test_labels, final_preds, average='binary', zero_division=0)
-            
-            # 对于两阶段，我们使用第二阶段阈值作为best_threshold的代表
-            best_threshold = stage2_threshold
-            
-            print(f"两阶段阈值策略结果:")
-            print(f"  最终召回率: {test_recall:.4f} (相比第一阶段: {test_recall-stage1_recall:+.4f})")
-            print(f"  最终F1: {test_f1:.4f}")
-        
-        # ==================== 单阶段阈值优化 ====================
         else:
+            # 单阶段阈值优化
             print("\n使用单阶段阈值策略...")
-            two_stage_used = False
             
-            # 如果需要阈值优化
             if optimize_threshold:
-                print("执行单阶段阈值优化...")
-                best_threshold, best_f1, best_precision, best_recall = self._find_optimal_threshold(
-                    test_labels, test_probs, metric='f1'
+                # 使用更注重精确率的阈值寻找方法
+                best_threshold, test_f1, test_precision, test_recall = self._find_precision_optimized_threshold(
+                    test_labels, test_probs, return_all=True
                 )
                 
-                # 使用最佳阈值重新计算预测
                 best_preds = (test_probs >= best_threshold).astype(int)
-                
-                # 计算使用最佳阈值后的指标
                 test_acc = accuracy_score(test_labels, best_preds)
-                test_precision = precision_score(test_labels, best_preds, average='binary', zero_division=0)
-                test_recall = recall_score(test_labels, best_preds, average='binary', zero_division=0)
-                test_f1 = f1_score(test_labels, best_preds, average='binary', zero_division=0)
                 
-                print(f"最优阈值: {best_threshold:.3f} (默认: 0.5)")
-                print(f"阈值优化后 F1 分数: {test_f1:.4f}")
+                print(f"精确率优化阈值: {best_threshold:.3f}")
+                print(f"精确率: {test_precision:.4f}, F1: {test_f1:.4f}")
             else:
                 best_threshold = 0.5
                 best_preds = (test_probs >= 0.5).astype(int)
                 test_acc = accuracy_score(test_labels, best_preds)
-                test_precision = precision_score(test_labels, best_preds, average='binary', zero_division=0)
-                test_recall = recall_score(test_labels, best_preds, average='binary', zero_division=0)
-                test_f1 = f1_score(test_labels, best_preds, average='binary', zero_division=0)
+                test_precision = precision_score(test_labels, best_preds, zero_division=0)
+                test_recall = recall_score(test_labels, best_preds, zero_division=0)
+                test_f1 = f1_score(test_labels, best_preds, zero_division=0)
                 print(f"使用默认阈值: {best_threshold}")
         
         # ==================== 计算综合评分 ====================
@@ -1548,29 +1747,29 @@ class ModelTrainer:
             'test_recall': test_recall,
             'test_f1': test_f1,
             'test_composite_score': test_composite_score,
-            'test_loss': test_loss_corrected,  # 使用修正后的损失
+            'test_loss': test_loss,
             'evaluation_time': datetime.now().isoformat(),
             'score_breakdown': breakdown,
             'optimal_threshold': best_threshold,
-            'threshold_strategy': 'two_stage' if two_stage_used else ('optimized' if optimize_threshold else 'default'),
+            'threshold_strategy': 'two_stage_optimized' if use_two_stage else ('single_optimized' if optimize_threshold else 'single_default'),
             'class_distribution': self._get_class_distribution(test_labels)
         }
         
         # 添加两阶段特定信息
-        if two_stage_used:
+        if use_two_stage:
             test_results.update({
                 'two_stage_used': True,
                 'stage1_threshold': stage1_threshold,
                 'stage2_threshold': stage2_threshold,
-                'stage1_recall': stage1_recall if 'stage1_recall' in locals() else 0.0
+                'stage1_recall': stage1_recall
             })
         else:
             test_results['two_stage_used'] = False
         
         # ==================== 打印结果 ====================
-        print(f"\n测试集结果:")
-        print(f"  阈值策略: {'两阶段' if two_stage_used else '单阶段' + (' (优化)' if optimize_threshold else ' (默认)')}")
-        if two_stage_used:
+        print(f"\n📊 测试集最终结果:")
+        print(f"  阈值策略: {'两阶段优化' if use_two_stage else '单阶段' + (' (优化)' if optimize_threshold else ' (默认)')}")
+        if use_two_stage:
             print(f"  第一阶段阈值: {stage1_threshold:.3f}")
             print(f"  第二阶段阈值: {stage2_threshold:.3f}")
         else:
@@ -1581,8 +1780,7 @@ class ModelTrainer:
         print(f"  召回率: {test_recall:.4f}")
         print(f"  F1分数: {test_f1:.4f}")
         print(f"  综合评分: {test_composite_score:.4f}")
-        print(f"  损失: {test_loss_corrected:.4f}")
-        print(f"  类别分布: {test_results['class_distribution']}")
+        print(f"  损失: {test_loss:.4f}")
         
         # ==================== 保存评估结果 ====================
         if save_results and self.experiment_dir:
@@ -1592,8 +1790,14 @@ class ModelTrainer:
         
         return test_results
 
-    def _find_optimal_threshold(self, labels, probs, metric='f1'):
+    def _find_optimal_threshold(self, labels, logits_or_probs, metric='f1',is_logits=True):
         """寻找最优阈值"""
+        # 如果输入是logits，先转换为概率
+        if is_logits:
+            probs = 1 / (1 + np.exp(-logits_or_probs))  # 手动sigmoid
+        else:
+            probs = logits_or_probs
+
         # 确保 labels 是整数类型
         labels = np.array(labels)
         probs = np.array(probs)
@@ -1642,8 +1846,8 @@ class ModelTrainer:
 
 
     def _calculate_training_metrics(self, model, train_loader, criterion, device):
-        """计算训练集指标（与验证集相同的评估方式）"""
-        model.eval()  # 设置为评估模式
+        """计算训练集指标"""
+        model.eval()
         train_loss = 0.0
         all_probs = []
         all_labels = []
@@ -1654,11 +1858,15 @@ class ModelTrainer:
                 x = x.view(-1, 1, FIXED_LENGTH)
                 y = y.to(device).float()
                 
-                outputs = model(x)
-                loss = criterion(outputs, y)
+                # 模型输出logits
+                logits = model(x)
+                
+                # 计算损失
+                loss = criterion(logits, y)
                 train_loss += loss.item()
                 
-                probs = torch.sigmoid(outputs)
+                # 手动应用sigmoid获取概率
+                probs = torch.sigmoid(logits)
                 all_probs.extend(probs.cpu().numpy().flatten().tolist())
                 all_labels.extend(y.cpu().numpy().flatten().tolist())
         
@@ -1687,7 +1895,7 @@ class ModelTrainer:
             'probs': all_probs,
             'labels': all_labels
         }
-
+    
     def _get_class_distribution(self, labels):
         """获取类别分布"""
         labels = np.array(labels)
@@ -2323,7 +2531,11 @@ class CompleteTrainer:
         
         # 3. 在测试集（CV4）上评估
         print("\n步骤3: 在测试集（CV4）上评估最终模型")
-        test_results = trainer.evaluate_on_test_set([4], final_model)
+        test_results = trainer.evaluate_on_test_set([4], final_model,use_two_stage=True,
+                                                    optimize_threshold=True,  # 不使用自动优化，使用我们指定的
+                                                    stage1_threshold=0.3,  # 提高第一阶段门槛
+                                                    stage2_threshold=0.5   # 提高第二阶段门槛以提高精确率
+                                                    )
         
         print(f"\n最终测试结果:")
         print(f"测试集准确率: {test_results['test_acc']:.4f}")

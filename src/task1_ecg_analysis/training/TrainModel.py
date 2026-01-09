@@ -254,6 +254,6 @@ class Mscnn(nn.Module):
             merge = x1_flat
 
         output = self.out(merge)
-        output = torch.sigmoid(output)  # 记得这里要改成 torch.sigmoid
+        # output = torch.sigmoid(output)  # 记得这里要改成 torch.sigmoid
 
         return output
